@@ -1,109 +1,92 @@
-# Shakespeare Student Lab
+# Shakespeare Text Lab
 
-Shakespeare Student Lab is a student-friendly text generation sandbox built for classroom exploration.
-Students start from a fresh random model, alternate between `sample` and `train`, and watch the model slowly learn the style of the Shakespeare corpus.
+This version of the project is packaged for classroom use.
+Students start from a fresh, untrained model, train a little at a time, and reset safely without touching the advanced model-building commands.
 
-This package is designed to be simple enough for high school students to use without needing the full research or engineering workflow.
+## Start Here
 
-## What It Includes
+On Mac, double-click `start_student.command`.
 
-- a default student shell with a very small command set
-- a separate teacher shell for advanced commands
-- safe checkpoint handling based on `.npz` files
-- a fresh-model student flow with a safe `reset`
-- built-in guardrails on sample length and training steps
-
-## Platform Notes
-
-The one-click launchers in this repo are for macOS.
-
-Students should have:
-
-- `python3` available
-- internet access on first launch so NumPy can install into a local `.venv`
-
-## Quick Start
-
-For students on Mac:
+If you prefer the terminal:
 
 ```bash
 ./start_student.command
 ```
 
-That opens the student shell, which starts from a fresh random model unless the student has already saved progress in `checkpoints/latest_model.npz`.
+That opens the student shell by default.
 
-Suggested first commands:
+## Teacher Note
 
-```text
-sample 500
-train 100
-status
-```
+Before sending this folder to students, remove `.venv` if it exists and then zip the folder.
+Students should use a Mac with `python3` available and internet access the first time they launch the package.
 
 ## Student Commands
 
 Inside the student shell, the main commands are:
 
 ```text
-sample [length] [prompt]
-train [steps]
+sample 250 "ROMEO:"
+train 200
 status
 reset
-doctor
 help
 quit
 ```
 
-Student mode guardrails:
+What they do:
 
-- sample length is capped at `1000`
-- training is capped at `5000` steps at a time
-- unsupported prompt characters are cleaned up with a note instead of crashing
-- `reset` returns to a fresh untrained model and clears saved progress safely
+- `sample [length] [prompt]` generates text from the current model.
+- `train [steps]` trains a little more and automatically saves progress.
+- `status` shows the current loss estimates.
+- `reset` goes back to a fresh untrained model and clears saved progress.
+- `doctor` checks whether the package looks ready to use.
 
-The first outputs will usually look like nonsense. That is expected and part of the learning experience.
+Student mode has guardrails:
+
+- sample length is capped at 1000 characters
+- training is capped at 5000 steps at a time
+- unsupported prompt characters are cleaned up with a note instead of crashing the session
+- the first output will usually look like nonsense until students train for a while
+
+## Files
+
+- `text_generator.py`: the program
+- `shakespeare.txt`: the training text
+- `checkpoints/latest_model.npz`: each student's saved progress
+- `start_student.command`: one-click student launcher for Mac
+- `start_teacher.command`: one-click advanced shell for Mac
 
 ## Teacher Mode
 
-For the advanced shell:
+If you want the original advanced workflow, run:
 
 ```bash
 ./start_teacher.command
 ```
 
-Teacher mode keeps the fuller workflow, including commands such as `save`, `load`, `rebuild`, and `clear-models`.
-The launcher adds an extra confirmation step before opening that mode.
+Or double-click `start_teacher.command`.
 
-## Classroom Handoff
+Teacher mode still supports commands like `save`, `load`, `rebuild`, and `clear-models`.
+An optional starter checkpoint is still included for teacher/demo use and is protected from accidental deletion.
+The teacher launcher asks before starting advanced mode and before installing requirements.
 
-If you are sending this to students as a zip:
+## Setup
 
-1. Remove `.venv` if it exists.
-2. Zip the folder.
-3. Tell students to double-click `start_student.command`.
+If Python packages are not installed yet:
 
-The first launch creates a local `.venv` and may prompt to install requirements from `requirements.txt`.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The launcher scripts create a local `.venv` when possible and ask before installing requirements on the first run.
+If the folder path contains `:`, they automatically store the virtual environment under `~/.shakespeare-text-lab/venvs/...` because macOS Python refuses to create a venv inside colon-containing paths.
+If you are setting up manually from a folder whose path contains `:`, create the virtual environment somewhere outside the project folder instead of using `.venv`.
+If NumPy is not already installed in that local environment, the first launch needs network access to fetch it.
 
 ## Safety Notes
 
-- normal checkpoints use the safer `.npz` format
-- legacy pickle checkpoints are blocked unless explicitly allowed with `--allow-unsafe-checkpoint`
-- student reset only clears managed student progress
-- teacher/demo starter checkpoints are protected from accidental deletion
-
-## Files
-
-- `text_generator.py`: main program
-- `shakespeare.txt`: training corpus
-- `checkpoints/starter_model.npz`: optional bundled starter checkpoint for teacher/demo use
-- `checkpoints/latest_model.npz`: saved student progress after training
-- `start_student.command`: student launcher
-- `start_teacher.command`: teacher launcher
-
-## Public Domain Text
-
-The Shakespeare source text in this repo is public domain.
-
-## License
-
-This project is released under the MIT License. See `LICENSE`.
+- Current checkpoints use a safe NumPy archive format (`.npz`) for normal saves and loads.
+- Legacy pickle checkpoints are blocked unless explicitly allowed with `--allow-unsafe-checkpoint`.
+- `reset` is safer than manually deleting checkpoint files.
