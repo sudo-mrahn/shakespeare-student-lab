@@ -11,7 +11,7 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -768,33 +768,127 @@ def doctor_report(
     return report
 
 
-class StudentShell:
+def show_doctor_report(
+    data_path: Path,
+    work_checkpoint_path: Path,
+    starter_checkpoint_path: Path | None,
+) -> None:
+    for line in doctor_report(
+        data_path,
+        work_checkpoint_path,
+        starter_checkpoint_path,
+    ):
+        print(line)
+
+
+def parse_shell_sample_args(args: list[str], *, default_length: int) -> tuple[int, str]:
+    length = default_length
+    prompt_args = args
+    if args:
+        try:
+            length = int(args[0])
+            prompt_args = args[1:]
+        except ValueError:
+            prompt_args = args
+    return length, " ".join(prompt_args)
+
+
+def run_sample_command(
+    trainer: TextGeneratorTrainer,
+    *,
+    prompt: str,
+    length: int,
+    temperature: float = 0.9,
+    top_k: int | None = None,
+) -> None:
+    clean_prompt, notes = sanitize_prompt(prompt, trainer.corpus)
+    for note in notes:
+        print(f"Note: {note}")
+    print(
+        trainer.model.generate(
+            trainer.corpus,
+            prompt=clean_prompt,
+            length=length,
+            temperature=temperature,
+            top_k=top_k,
+        )
+    )
+
+
+def train_and_save(
+    trainer: TextGeneratorTrainer,
+    *,
+    steps: int,
+    data_path: Path,
+    checkpoint_path: Path,
+    log_every: int = 100,
+) -> None:
+    trainer.train(steps=steps, log_every=log_every)
+    trainer.save(checkpoint_path, data_path)
+
+
+class BaseShell:
+    prompt = "> "
+
     def __init__(
         self,
         trainer: TextGeneratorTrainer,
         data_path: Path,
         checkpoint_path: Path,
-        starter_checkpoint_path: Path | None,
-        source_checkpoint_path: Path | None,
-        allow_unsafe_checkpoint: bool = False,
     ) -> None:
         self.trainer = trainer
         self.data_path = data_path
         self.checkpoint_path = checkpoint_path
-        self.starter_checkpoint_path = starter_checkpoint_path
-        self.source_checkpoint_path = source_checkpoint_path
-        self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
+
+    def intro_lines(self) -> list[str]:
+        return []
+
+    def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
+        return {
+            "help": self.handle_help,
+            "?": self.handle_help,
+            "status": self.handle_status,
+            "config": self.handle_config,
+            "doctor": self.handle_doctor,
+            "quit": self.handle_quit,
+            "exit": self.handle_quit,
+        }
+
+    def get_doctor_starter_checkpoint_path(self) -> Path | None:
+        return None
+
+    def print_help(self) -> None:
+        raise NotImplementedError
+
+    def print_unknown_command(self, command: str) -> None:
+        print(f"Unknown command: {command}")
+
+    def handle_help(self, args: list[str]) -> None:
+        self.print_help()
+
+    def handle_status(self, args: list[str]) -> None:
+        print(self.trainer.status())
+
+    def handle_config(self, args: list[str]) -> None:
+        print(self.trainer.config())
+
+    def handle_doctor(self, args: list[str]) -> None:
+        show_doctor_report(
+            self.data_path,
+            self.checkpoint_path,
+            self.get_doctor_starter_checkpoint_path(),
+        )
+
+    def handle_quit(self, args: list[str]) -> bool:
+        return False
 
     def cmdloop(self) -> None:
-        print("Student-friendly Shakespeare text lab")
-        print(f"Starting from {describe_checkpoint_source(self.source_checkpoint_path)}.")
-        print("Try: sample 500")
-        print("Then: train 100")
-        print("Type 'help' for the small command list.")
+        for line in self.intro_lines():
+            print(line)
 
         while True:
             try:
-                line = input("student> ").strip()
+                line = input(self.prompt).strip()
             except EOFError:
                 print()
                 break
@@ -817,31 +911,64 @@ class StudentShell:
 
         command = parts[0].lower()
         args = parts[1:]
+        handler = self.command_handlers().get(command)
+        if handler is None:
+            self.print_unknown_command(command)
+            return True
 
         try:
-            if command in {"help", "?"}:
-                self.print_help()
-            elif command == "status":
-                print(self.trainer.status())
-            elif command == "config":
-                print(self.trainer.config())
-            elif command == "sample":
-                self.sample(args)
-            elif command == "train":
-                self.train(args)
-            elif command in {"reset", "starter"}:
-                self.reset_to_fresh()
-            elif command == "doctor":
-                self.print_doctor_report()
-            elif command in {"quit", "exit"}:
-                return False
-            else:
-                print(f"Unknown command: {command}")
-                print("Type 'help' to see the student command list.")
+            result = handler(args)
         except Exception as exc:  # noqa: BLE001
             print(f"Command failed: {exc}")
+            return True
 
-        return True
+        return result is not False
+
+
+class StudentShell(BaseShell):
+    prompt = "student> "
+
+    def __init__(
+        self,
+        trainer: TextGeneratorTrainer,
+        data_path: Path,
+        checkpoint_path: Path,
+        starter_checkpoint_path: Path | None,
+        source_checkpoint_path: Path | None,
+        allow_unsafe_checkpoint: bool = False,
+    ) -> None:
+        super().__init__(trainer, data_path, checkpoint_path)
+        self.starter_checkpoint_path = starter_checkpoint_path
+        self.source_checkpoint_path = source_checkpoint_path
+        self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
+
+    def intro_lines(self) -> list[str]:
+        return [
+            "Student-friendly Shakespeare text lab",
+            f"Starting from {describe_checkpoint_source(self.source_checkpoint_path)}.",
+            "Try: sample 500",
+            "Then: train 100",
+            "Type 'help' for the small command list.",
+        ]
+
+    def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
+        handlers = super().command_handlers()
+        handlers.update(
+            {
+                "sample": self.sample,
+                "train": self.train,
+                "reset": self.handle_reset,
+                "starter": self.handle_reset,
+            }
+        )
+        return handlers
+
+    def get_doctor_starter_checkpoint_path(self) -> Path | None:
+        return self.starter_checkpoint_path
+
+    def print_unknown_command(self, command: str) -> None:
+        print(f"Unknown command: {command}")
+        print("Type 'help' to see the student command list.")
 
     def train(self, args: list[str]) -> None:
         steps = STUDENT_DEFAULT_TRAIN_STEPS
@@ -854,21 +981,20 @@ class StudentShell:
                 f"steps is capped at {STUDENT_MAX_TRAIN_STEPS} in student mode to keep runs manageable"
             )
 
-        self.trainer.train(steps=steps)
-        self.trainer.save(self.checkpoint_path, self.data_path)
+        train_and_save(
+            self.trainer,
+            steps=steps,
+            data_path=self.data_path,
+            checkpoint_path=self.checkpoint_path,
+        )
         self.source_checkpoint_path = self.checkpoint_path
         print(f"Saved your progress to {self.checkpoint_path}")
 
     def sample(self, args: list[str]) -> None:
-        length = STUDENT_DEFAULT_SAMPLE_LENGTH
-        prompt_args = args
-        if args:
-            try:
-                length = int(args[0])
-                prompt_args = args[1:]
-            except ValueError:
-                prompt_args = args
-
+        length, prompt = parse_shell_sample_args(
+            args,
+            default_length=STUDENT_DEFAULT_SAMPLE_LENGTH,
+        )
         if length <= 0:
             raise ValueError("sample length must be a positive integer")
         if length > STUDENT_MAX_SAMPLE_LENGTH:
@@ -876,17 +1002,14 @@ class StudentShell:
                 f"sample length is capped at {STUDENT_MAX_SAMPLE_LENGTH} characters in student mode"
             )
 
-        prompt = " ".join(prompt_args)
-        clean_prompt, notes = sanitize_prompt(prompt, self.trainer.corpus)
-        for note in notes:
-            print(f"Note: {note}")
-        print(
-            self.trainer.model.generate(
-                self.trainer.corpus,
-                prompt=clean_prompt,
-                length=length,
-            )
+        run_sample_command(
+            self.trainer,
+            prompt=prompt,
+            length=length,
         )
+
+    def handle_reset(self, args: list[str]) -> None:
+        self.reset_to_fresh()
 
     def reset_to_fresh(self) -> None:
         checkpoint_path = self.checkpoint_path.expanduser().resolve()
@@ -909,14 +1032,6 @@ class StudentShell:
         self.source_checkpoint_path = None
         print("Reset complete. You are back to a fresh random model with no saved progress.")
 
-    def print_doctor_report(self) -> None:
-        for line in doctor_report(
-            self.data_path,
-            self.checkpoint_path,
-            self.starter_checkpoint_path,
-        ):
-            print(line)
-
     @staticmethod
     def print_help() -> None:
         print("Commands:")
@@ -934,7 +1049,9 @@ class StudentShell:
         print("  quit                     Exit the shell")
 
 
-class TrainingShell:
+class TrainingShell(BaseShell):
+    prompt = "textgen> "
+
     def __init__(
         self,
         trainer: TextGeneratorTrainer,
@@ -942,124 +1059,93 @@ class TrainingShell:
         checkpoint_path: Path,
         allow_unsafe_checkpoint: bool = False,
     ) -> None:
-        self.trainer = trainer
-        self.data_path = data_path
-        self.checkpoint_path = checkpoint_path
+        super().__init__(trainer, data_path, checkpoint_path)
         self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
 
-    def cmdloop(self) -> None:
-        print("Interactive text-generator shell")
-        print("Type 'help' for commands.")
+    def intro_lines(self) -> list[str]:
+        return [
+            "Interactive text-generator shell",
+            "Type 'help' for commands.",
+        ]
 
-        while True:
-            try:
-                line = input("textgen> ").strip()
-            except EOFError:
-                print()
-                break
-            except KeyboardInterrupt:
-                print()
-                continue
+    def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
+        handlers = super().command_handlers()
+        handlers.update(
+            {
+                "train": self.train,
+                "sample": self.sample,
+                "save": self.save,
+                "load": self.load,
+                "rebuild": self.handle_rebuild,
+                "rebuild-model": self.handle_rebuild,
+                "rebuild_model": self.handle_rebuild,
+                "clear-models": self.handle_clear_models,
+                "clear_models": self.handle_clear_models,
+            }
+        )
+        return handlers
 
-            if not line:
-                continue
+    def get_doctor_starter_checkpoint_path(self) -> Path | None:
+        return resolve_starter_checkpoint_path()
 
-            if not self.execute(line):
-                break
+    def train(self, args: list[str]) -> None:
+        steps = int(args[0]) if args else 500
+        train_and_save(
+            self.trainer,
+            steps=steps,
+            data_path=self.data_path,
+            checkpoint_path=self.checkpoint_path,
+        )
 
-    def execute(self, line: str) -> bool:
-        try:
-            parts = shlex.split(line)
-        except ValueError as exc:
-            print(f"Could not parse command: {exc}")
-            return True
+    def sample(self, args: list[str]) -> None:
+        length, prompt = parse_shell_sample_args(args, default_length=300)
+        run_sample_command(
+            self.trainer,
+            prompt=prompt,
+            length=length,
+        )
 
-        command = parts[0].lower()
-        args = parts[1:]
+    def save(self, args: list[str]) -> None:
+        path = Path(args[0]) if args else self.checkpoint_path
+        self.trainer.save(path, self.data_path)
 
-        try:
-            if command in {"help", "?"}:
-                self.print_help()
-            elif command == "config":
-                print(self.trainer.config())
-            elif command == "status":
-                print(self.trainer.status())
-            elif command == "doctor":
-                for line in doctor_report(
-                    self.data_path,
-                    self.checkpoint_path,
-                    resolve_starter_checkpoint_path(),
-                ):
-                    print(line)
-            elif command == "train":
-                steps = int(args[0]) if args else 500
-                self.trainer.train(steps=steps)
-                self.trainer.save(self.checkpoint_path, self.data_path)
-            elif command == "sample":
-                length = 300
-                prompt_args = args
-                if args:
-                    try:
-                        length = int(args[0])
-                        prompt_args = args[1:]
-                    except ValueError:
-                        prompt_args = args
-                prompt = " ".join(prompt_args)
-                clean_prompt, notes = sanitize_prompt(prompt, self.trainer.corpus)
-                for note in notes:
-                    print(f"Note: {note}")
-                print(
-                    self.trainer.model.generate(
-                        self.trainer.corpus,
-                        prompt=clean_prompt,
-                        length=length,
-                    )
-                )
-            elif command == "save":
-                path = Path(args[0]) if args else self.checkpoint_path
-                self.trainer.save(path, self.data_path)
-            elif command == "load":
-                allow_unsafe_checkpoint = self.allow_unsafe_checkpoint
-                path_args: list[str] = []
-                for arg in args:
-                    if arg == "--unsafe":
-                        allow_unsafe_checkpoint = True
-                    else:
-                        path_args.append(arg)
-                if len(path_args) > 1:
-                    raise ValueError("Usage: load [path] [--unsafe]")
-                path = Path(path_args[0]) if path_args else self.checkpoint_path
-                self.trainer = TextGeneratorTrainer.load(
-                    path,
-                    self.trainer.corpus,
-                    self.data_path,
-                    allow_unsafe_checkpoint=allow_unsafe_checkpoint,
-                )
-                print(f"Loaded checkpoint from {path}")
-            elif command in {"rebuild", "rebuild-model", "rebuild_model"}:
-                if len(args) not in {3, 5}:
-                    print(
-                        "Usage: rebuild <context_size> <hidden_dim> <learning_rate> "
-                        "[batch_size] [embed_dim]"
-                    )
-                else:
-                    self.rebuild_model(
-                        context_size=int(args[0]),
-                        hidden_dim=int(args[1]),
-                        learning_rate=float(args[2]),
-                        batch_size=int(args[3]) if len(args) == 5 else None,
-                        embed_dim=int(args[4]) if len(args) == 5 else None,
-                    )
-            elif command in {"clear-models", "clear_models"}:
-                self.clear_saved_models()
-            elif command in {"quit", "exit"}:
-                return False
+    def load(self, args: list[str]) -> None:
+        allow_unsafe_checkpoint = self.allow_unsafe_checkpoint
+        path_args: list[str] = []
+        for arg in args:
+            if arg == "--unsafe":
+                allow_unsafe_checkpoint = True
             else:
-                print(f"Unknown command: {command}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Command failed: {exc}")
+                path_args.append(arg)
+        if len(path_args) > 1:
+            raise ValueError("Usage: load [path] [--unsafe]")
+        path = Path(path_args[0]) if path_args else self.checkpoint_path
+        self.trainer = TextGeneratorTrainer.load(
+            path,
+            self.trainer.corpus,
+            self.data_path,
+            allow_unsafe_checkpoint=allow_unsafe_checkpoint,
+        )
+        print(f"Loaded checkpoint from {path}")
 
-        return True
+    def handle_rebuild(self, args: list[str]) -> None:
+        if len(args) not in {3, 5}:
+            print(
+                "Usage: rebuild <context_size> <hidden_dim> <learning_rate> "
+                "[batch_size] [embed_dim]"
+            )
+            return
+
+        self.rebuild_model(
+            context_size=int(args[0]),
+            hidden_dim=int(args[1]),
+            learning_rate=float(args[2]),
+            batch_size=int(args[3]) if len(args) == 5 else None,
+            embed_dim=int(args[4]) if len(args) == 5 else None,
+        )
+
+    def handle_clear_models(self, args: list[str]) -> None:
+        self.clear_saved_models()
 
     def clear_saved_models(self) -> None:
         checkpoint_path = self.checkpoint_path.expanduser().resolve()
@@ -1280,12 +1366,11 @@ def main() -> int:
     checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
 
     if args.command == "doctor":
-        for line in doctor_report(
+        show_doctor_report(
             data_path,
             checkpoint_path,
             resolve_starter_checkpoint_path(),
-        ):
-            print(line)
+        )
         return 0
 
     if args.command == "student":
@@ -1320,26 +1405,24 @@ def main() -> int:
         return 0
 
     if args.command == "train":
-        trainer.train(
+        train_and_save(
+            trainer,
             steps=args.steps,
+            data_path=data_path,
+            checkpoint_path=checkpoint_path,
             log_every=args.log_every,
         )
-        trainer.save(checkpoint_path, data_path)
         print(trainer.status())
         return 0
 
     if args.command == "sample":
-        prompt, notes = sanitize_prompt(args.prompt, trainer.corpus)
-        for note in notes:
-            print(f"Note: {note}")
-        sample = trainer.model.generate(
-            trainer.corpus,
-            prompt=prompt,
+        run_sample_command(
+            trainer,
+            prompt=args.prompt,
             length=args.length,
             temperature=args.temperature,
             top_k=args.top_k,
         )
-        print(sample)
         return 0
 
     parser.print_help()

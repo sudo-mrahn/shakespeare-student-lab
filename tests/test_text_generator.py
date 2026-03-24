@@ -1,9 +1,12 @@
 import pickle
+from contextlib import redirect_stdout
+import io
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -440,6 +443,109 @@ class StudentFlowTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "capped at"):
                 shell.train([str(text_generator.STUDENT_MAX_TRAIN_STEPS + 1)])
+
+
+class ShellDispatchTests(unittest.TestCase):
+    def make_temp_shell(self, shell_type: str):
+        tmpdir = tempfile.TemporaryDirectory()
+        root = Path(tmpdir.name)
+        data_path = root / "data.txt"
+        checkpoint_path = root / "latest_model.npz"
+        starter_path = root / "starter_model.npz"
+        data_path.write_text("abcaabca\n", encoding="utf-8")
+
+        trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+        trainer.save(starter_path, data_path)
+
+        if shell_type == "student":
+            shell = text_generator.StudentShell(
+                trainer=trainer,
+                data_path=data_path,
+                checkpoint_path=checkpoint_path,
+                starter_checkpoint_path=starter_path,
+                source_checkpoint_path=starter_path,
+            )
+        elif shell_type == "training":
+            shell = text_generator.TrainingShell(
+                trainer=trainer,
+                data_path=data_path,
+                checkpoint_path=checkpoint_path,
+            )
+        else:
+            raise ValueError(shell_type)
+
+        return tmpdir, shell, data_path, checkpoint_path, starter_path
+
+    def test_student_shell_dispatches_help_status_config_and_quit(self) -> None:
+        tmpdir, shell, _, _, _ = self.make_temp_shell("student")
+        self.addCleanup(tmpdir.cleanup)
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("help"))
+        self.assertIn("Student mode caps", stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("status"))
+        self.assertIn("steps=", stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("config"))
+        self.assertIn("grad_clip=", stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertFalse(shell.execute("quit"))
+        self.assertEqual(stdout.getvalue(), "")
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertFalse(shell.execute("exit"))
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_student_shell_reset_aliases_clear_progress_and_restore_fresh_model(self) -> None:
+        for command in ("reset", "starter"):
+            with self.subTest(command=command):
+                tmpdir, shell, _, checkpoint_path, starter_path = self.make_temp_shell("student")
+                self.addCleanup(tmpdir.cleanup)
+
+                shell.source_checkpoint_path = starter_path
+                checkpoint_path.write_text("existing checkpoint", encoding="utf-8")
+
+                old_default_checkpoint = text_generator.DEFAULT_CHECKPOINT_PATH
+                text_generator.DEFAULT_CHECKPOINT_PATH = checkpoint_path
+                try:
+                    with redirect_stdout(io.StringIO()) as stdout:
+                        self.assertTrue(shell.execute(command))
+                finally:
+                    text_generator.DEFAULT_CHECKPOINT_PATH = old_default_checkpoint
+
+                self.assertIn("Reset complete", stdout.getvalue())
+                self.assertFalse(checkpoint_path.exists())
+                self.assertIsNone(shell.source_checkpoint_path)
+
+    def test_training_shell_dispatches_help_status_config_doctor_and_exit(self) -> None:
+        tmpdir, shell, data_path, _, starter_path = self.make_temp_shell("training")
+        self.addCleanup(tmpdir.cleanup)
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("help"))
+        self.assertIn("clear-models", stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("status"))
+        self.assertIn("steps=", stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertTrue(shell.execute("config"))
+        self.assertIn("seed=", stdout.getvalue())
+
+        with mock.patch("text_generator.resolve_starter_checkpoint_path", return_value=starter_path):
+            with redirect_stdout(io.StringIO()) as stdout:
+                self.assertTrue(shell.execute("doctor"))
+        self.assertIn("Training text: OK", stdout.getvalue())
+        self.assertIn(str(data_path), stdout.getvalue())
+
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertFalse(shell.execute("exit"))
+        self.assertEqual(stdout.getvalue(), "")
 
 
 if __name__ == "__main__":
