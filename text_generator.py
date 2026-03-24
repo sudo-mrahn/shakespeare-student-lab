@@ -704,7 +704,7 @@ def load_trainer_from_checkpoint(
 
 def build_student_trainer(args: argparse.Namespace) -> tuple[TextGeneratorTrainer, Path | None]:
     data_path = Path(args.data).expanduser().resolve()
-    work_checkpoint_path = student_checkpoint_path()
+    work_checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
 
     if args.fresh:
         return (
@@ -1176,29 +1176,24 @@ class TrainingShell:
 def build_trainer_from_args(args: argparse.Namespace) -> TextGeneratorTrainer:
     data_path = Path(args.data).expanduser().resolve()
     if args.command == "sample":
-        if args.checkpoint is not None:
-            checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
-            if checkpoint_path.exists() and not args.fresh:
-                return load_trainer_from_checkpoint(
-                    checkpoint_path,
-                    data_path=data_path,
-                    context_size=args.context_size,
-                    allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
-                )
-            if not args.fresh:
+        if not args.fresh:
+            if args.checkpoint is None:
                 raise FileNotFoundError(
-                    f"No checkpoint found at {checkpoint_path}. "
-                    "Train a model first, or pass --fresh to sample from a new random model."
+                    "No checkpoint specified for sample. "
+                    "Pass --checkpoint to sample a saved model, or --fresh to sample from a new random model."
                 )
-        else:
-            checkpoint_path = student_checkpoint_path()
-            if checkpoint_path.exists() and not args.fresh:
+            checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
+            if checkpoint_path.exists():
                 return load_trainer_from_checkpoint(
                     checkpoint_path,
                     data_path=data_path,
                     context_size=args.context_size,
                     allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
                 )
+            raise FileNotFoundError(
+                f"No checkpoint found at {checkpoint_path}. "
+                "Train a model first, or pass --fresh to sample from a new random model."
+            )
 
     checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
     if checkpoint_path.exists() and not args.fresh:
@@ -1301,7 +1296,7 @@ def main() -> int:
         shell = StudentShell(
             trainer=trainer,
             data_path=data_path,
-            checkpoint_path=student_checkpoint_path(),
+            checkpoint_path=checkpoint_path,
             starter_checkpoint_path=resolve_starter_checkpoint_path(),
             source_checkpoint_path=source_checkpoint_path,
             allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
