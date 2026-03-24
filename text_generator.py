@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import pickle
+import re
 import shlex
+import shutil
 import sys
 import unicodedata
 import zipfile
@@ -17,9 +21,11 @@ import numpy as np
 
 CHECKPOINTS_DIR = Path(__file__).with_name("checkpoints")
 DEFAULT_DATA_PATH = Path(__file__).with_name("shakespeare.txt")
-DEFAULT_CHECKPOINT_PATH = CHECKPOINTS_DIR / "latest_model.npz"
+LEGACY_CHECKPOINT_PATH = CHECKPOINTS_DIR / "latest_model.npz"
+MANAGED_SESSIONS_DIR = CHECKPOINTS_DIR / "sessions"
 DEFAULT_STARTER_CHECKPOINT_PATH = CHECKPOINTS_DIR / "starter_model.npz"
-CHECKPOINT_SUFFIXES = {".npz", ".pkl", ".pickle"}
+SESSION_CHECKPOINT_FILENAME = "latest_model.npz"
+SESSION_LOCK_FILENAME = "session.lock"
 PAD_TOKEN = "\0"
 PROMPT_TRANSLATION_TABLE = str.maketrans(
     {
@@ -33,10 +39,18 @@ PROMPT_TRANSLATION_TABLE = str.maketrans(
         "\t": " ",
     }
 )
-STUDENT_DEFAULT_SAMPLE_LENGTH = 250
-STUDENT_DEFAULT_TRAIN_STEPS = 200
-STUDENT_MAX_SAMPLE_LENGTH = 1000
-STUDENT_MAX_TRAIN_STEPS = 5000
+DEFAULT_SHELL_SAMPLE_LENGTH = 300
+DEFAULT_SHELL_TRAIN_STEPS = 500
+DEFAULT_SESSION_NAME = "default"
+SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+class SessionError(ValueError):
+    pass
+
+
+class SessionLockError(RuntimeError):
+    pass
 
 
 def read_text(path: Path) -> str:
@@ -65,10 +79,6 @@ def parse_positive_float(value: str) -> float:
 
 def corpus_fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def is_checkpoint_file(path: Path) -> bool:
-    return path.suffix.lower() in CHECKPOINT_SUFFIXES
 
 
 def normalize_prompt(prompt: str) -> str:
@@ -101,29 +111,8 @@ def sanitize_prompt(prompt: str, corpus: Corpus) -> tuple[str, list[str]]:
     return "".join(cleaned_chars), notes
 
 
-def resolve_checkpoint_argument(checkpoint: str | None, default_path: Path) -> Path:
-    if checkpoint is None:
-        return default_path.expanduser().resolve()
+def resolve_checkpoint_argument(checkpoint: str) -> Path:
     return Path(checkpoint).expanduser().resolve()
-
-
-def choose_sample_checkpoint_path(
-    checkpoint: str | None,
-    *,
-    allow_unsafe_checkpoint: bool = False,
-    work_checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
-) -> Path:
-    if checkpoint is not None:
-        return Path(checkpoint).expanduser().resolve()
-    return work_checkpoint_path.expanduser().resolve()
-
-
-def student_checkpoint_path() -> Path:
-    return DEFAULT_CHECKPOINT_PATH.expanduser().resolve()
-
-
-def starter_checkpoint_candidates() -> list[Path]:
-    return [DEFAULT_STARTER_CHECKPOINT_PATH.expanduser().resolve()]
 
 
 def resolve_starter_checkpoint_path() -> Path | None:
@@ -133,15 +122,217 @@ def resolve_starter_checkpoint_path() -> Path | None:
     return None
 
 
-def describe_checkpoint_source(path: Path | None) -> str:
-    if path is None:
-        return "a fresh random model"
-    resolved = path.expanduser().resolve()
-    if resolved == DEFAULT_CHECKPOINT_PATH.expanduser().resolve():
-        return "your saved progress"
-    if resolved == DEFAULT_STARTER_CHECKPOINT_PATH.expanduser().resolve():
-        return "the bundled starter model"
-    return f"the checkpoint at {resolved}"
+def explicit_checkpoint_lock_path(checkpoint_path: Path) -> Path:
+    resolved = checkpoint_path.expanduser().resolve()
+    return resolved.parent / f"{resolved.name}.lock"
+
+
+@dataclass(frozen=True)
+class RunTarget:
+    checkpoint_path: Path
+    lock_path: Path | None
+    session_name: str | None
+    managed: bool
+
+    @property
+    def label(self) -> str:
+        if self.managed:
+            return f"Session '{self.session_name}'"
+        return f"Checkpoint {self.checkpoint_path}"
+
+
+@dataclass
+class LockHandle:
+    path: Path
+    label: str
+    handle: Any
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        self.handle = None
+
+    def __enter__(self) -> "LockHandle":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release()
+
+
+def acquire_exclusive_lock(lock_path: Path, label: str) -> LockHandle:
+    resolved = lock_path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    handle = resolved.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise SessionLockError(
+            f"{label} is already in use. Choose another session or close the other process."
+        ) from exc
+    return LockHandle(path=resolved, label=label, handle=handle)
+
+
+def acquire_target_lock(target: RunTarget) -> contextlib.AbstractContextManager[LockHandle | None]:
+    if target.lock_path is None:
+        return contextlib.nullcontext()
+    return acquire_exclusive_lock(target.lock_path, target.label)
+
+
+class SessionManager:
+    def __init__(
+        self,
+        *,
+        sessions_root: Path | None = None,
+        legacy_checkpoint_path: Path | None = None,
+    ) -> None:
+        root = MANAGED_SESSIONS_DIR if sessions_root is None else sessions_root
+        legacy = LEGACY_CHECKPOINT_PATH if legacy_checkpoint_path is None else legacy_checkpoint_path
+        self.sessions_root = root.expanduser().resolve()
+        self.legacy_checkpoint_path = legacy.expanduser().resolve()
+
+    def validate_name(self, name: str) -> str:
+        cleaned = name.strip()
+        if not cleaned:
+            raise SessionError("Session names cannot be empty.")
+        if SESSION_NAME_PATTERN.fullmatch(cleaned) is None:
+            raise SessionError(
+                "Session names may use only ASCII letters, digits, '.', '_' and '-'."
+            )
+        return cleaned
+
+    def session_dir(self, name: str) -> Path:
+        validated = self.validate_name(name)
+        return self.sessions_root / validated
+
+    def checkpoint_path(self, name: str) -> Path:
+        return self.session_dir(name) / SESSION_CHECKPOINT_FILENAME
+
+    def lock_path(self, name: str) -> Path:
+        return self.session_dir(name) / SESSION_LOCK_FILENAME
+
+    def ensure_session_dir(self, name: str) -> Path:
+        directory = self.session_dir(name)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def target_for_session(self, name: str) -> RunTarget:
+        validated = self.validate_name(name)
+        self.ensure_session_dir(validated)
+        return RunTarget(
+            checkpoint_path=self.checkpoint_path(validated),
+            lock_path=self.lock_path(validated),
+            session_name=validated,
+            managed=True,
+        )
+
+    def target_for_checkpoint(self, checkpoint_path: Path) -> RunTarget:
+        resolved = checkpoint_path.expanduser().resolve()
+        return RunTarget(
+            checkpoint_path=resolved,
+            lock_path=explicit_checkpoint_lock_path(resolved),
+            session_name=None,
+            managed=False,
+        )
+
+    def list_sessions(self) -> list[str]:
+        if not self.sessions_root.exists():
+            return []
+        names = [
+            path.name
+            for path in self.sessions_root.iterdir()
+            if path.is_dir() and SESSION_NAME_PATTERN.fullmatch(path.name)
+        ]
+        return sorted(names)
+
+    def is_locked(self, name: str) -> bool:
+        validated = self.validate_name(name)
+        if not self.session_dir(validated).exists():
+            return False
+        try:
+            lock = acquire_exclusive_lock(self.lock_path(validated), f"Session '{validated}'")
+        except SessionLockError:
+            return True
+        lock.release()
+        return False
+
+    def migrate_legacy_checkpoint(self) -> list[str]:
+        messages: list[str] = []
+        legacy_path = self.legacy_checkpoint_path
+        default_checkpoint_path = self.checkpoint_path(DEFAULT_SESSION_NAME)
+
+        if not legacy_path.exists():
+            return messages
+
+        if default_checkpoint_path.exists():
+            messages.append(
+                "Warning: a legacy checkpoint and session 'default' both exist. "
+                "Using the session copy and leaving the legacy checkpoint untouched."
+            )
+            return messages
+
+        default_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.replace(default_checkpoint_path)
+        messages.append(
+            "Migrated legacy saved progress into session 'default'."
+        )
+        return messages
+
+    def choose_session_interactively(self) -> str:
+        while True:
+            session_names = self.list_sessions()
+            print("Managed sessions:")
+            if session_names:
+                for index, name in enumerate(session_names, start=1):
+                    status = "locked" if self.is_locked(name) else "available"
+                    print(f"  {index}. {name} ({status})")
+            else:
+                print("  (none yet)")
+
+            raw = input("Choose a session number or enter a new session name: ").strip()
+            if not raw:
+                print("Please enter a session number or a new session name.")
+                continue
+
+            if raw.isdigit():
+                index = int(raw)
+                if 1 <= index <= len(session_names):
+                    chosen = session_names[index - 1]
+                else:
+                    chosen = raw
+            else:
+                chosen = raw
+
+            try:
+                validated = self.validate_name(chosen)
+            except SessionError as exc:
+                print(exc)
+                continue
+
+            if self.is_locked(validated):
+                print(
+                    f"Session '{validated}' is already in use. "
+                    "Choose another session or close the other process."
+                )
+                continue
+
+            self.ensure_session_dir(validated)
+            return validated
+
+    def delete_session(self, name: str, *, current_session: str | None = None) -> str:
+        validated = self.validate_name(name)
+        if current_session == validated:
+            raise ValueError("Refusing to delete the current session.")
+
+        session_dir = self.session_dir(validated)
+        if not session_dir.exists():
+            return f"No session named '{validated}'."
+
+        with acquire_exclusive_lock(self.lock_path(validated), f"Session '{validated}'"):
+            shutil.rmtree(session_dir)
+        return f"Deleted session '{validated}'."
 
 
 @dataclass
@@ -604,7 +795,6 @@ class TextGeneratorTrainer:
         cls,
         path: Path,
         corpus: Corpus,
-        data_path: Path | None = None,
         allow_unsafe_checkpoint: bool = False,
     ) -> "TextGeneratorTrainer":
         path = path.expanduser().resolve()
@@ -685,6 +875,19 @@ def build_new_trainer(
     )
 
 
+def build_new_trainer_from_args(args: argparse.Namespace, data_path: Path) -> TextGeneratorTrainer:
+    return build_new_trainer(
+        data_path,
+        context_size=args.context_size,
+        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        grad_clip=args.grad_clip,
+        seed=args.seed,
+    )
+
+
 def load_trainer_from_checkpoint(
     checkpoint_path: Path,
     *,
@@ -697,70 +900,70 @@ def load_trainer_from_checkpoint(
     return TextGeneratorTrainer.load(
         checkpoint_path,
         corpus,
-        data_path,
         allow_unsafe_checkpoint=allow_unsafe_checkpoint,
     )
 
 
-def build_student_trainer(args: argparse.Namespace) -> tuple[TextGeneratorTrainer, Path | None]:
-    data_path = Path(args.data).expanduser().resolve()
-    work_checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
-
+def build_trainer_for_target(
+    args: argparse.Namespace,
+    *,
+    data_path: Path,
+    target: RunTarget,
+    require_existing_checkpoint: bool = False,
+) -> tuple[TextGeneratorTrainer, Path | None]:
     if args.fresh:
-        return (
-            build_new_trainer(
-                data_path,
-                context_size=args.context_size,
-                embed_dim=args.embed_dim,
-                hidden_dim=args.hidden_dim,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                grad_clip=args.grad_clip,
-                seed=args.seed,
-            ),
-            None,
-        )
+        return build_new_trainer_from_args(args, data_path), None
 
-    if work_checkpoint_path.exists():
+    if target.checkpoint_path.exists():
         return (
             load_trainer_from_checkpoint(
-                work_checkpoint_path,
+                target.checkpoint_path,
                 data_path=data_path,
                 context_size=args.context_size,
                 allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
             ),
-            work_checkpoint_path,
+            target.checkpoint_path,
         )
 
-    return (
-        build_new_trainer(
-            data_path,
-            context_size=args.context_size,
-            embed_dim=args.embed_dim,
-            hidden_dim=args.hidden_dim,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            grad_clip=args.grad_clip,
-            seed=args.seed,
-        ),
-        None,
-    )
+    if require_existing_checkpoint:
+        if target.managed:
+            raise FileNotFoundError(
+                f"No saved progress found for session '{target.session_name}'. "
+                "Train that session first, or pass --fresh."
+            )
+        raise FileNotFoundError(
+            f"No checkpoint found at {target.checkpoint_path}. "
+            "Train a model first, or pass --fresh."
+        )
+
+    return build_new_trainer_from_args(args, data_path), None
 
 
 def doctor_report(
     data_path: Path,
-    work_checkpoint_path: Path,
+    target: RunTarget | None,
     starter_checkpoint_path: Path | None,
+    session_manager: SessionManager,
 ) -> list[str]:
+    session_names = session_manager.list_sessions()
     report = [
         f"Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         f"NumPy: {np.__version__}",
         f"Training text: {'OK' if data_path.exists() else 'MISSING'} ({data_path})",
-        (
-            f"Saved progress checkpoint: {'FOUND' if work_checkpoint_path.exists() else 'NOT FOUND'} "
-            f"({work_checkpoint_path})"
-        ),
+        f"Sessions directory: {session_manager.sessions_root}",
+        f"Managed sessions: {', '.join(session_names) if session_names else 'none'}",
     ]
+    if target is None:
+        report.append("Active target: none selected")
+    elif target.managed:
+        checkpoint_status = "FOUND" if target.checkpoint_path.exists() else "NOT FOUND"
+        report.append(
+            f"Active session: {target.session_name} ({checkpoint_status}) "
+            f"({target.checkpoint_path})"
+        )
+    else:
+        checkpoint_status = "FOUND" if target.checkpoint_path.exists() else "NOT FOUND"
+        report.append(f"Explicit checkpoint: {checkpoint_status} ({target.checkpoint_path})")
     if starter_checkpoint_path is None:
         report.append("Starter checkpoint: NOT FOUND")
     else:
@@ -770,13 +973,15 @@ def doctor_report(
 
 def show_doctor_report(
     data_path: Path,
-    work_checkpoint_path: Path,
+    target: RunTarget | None,
     starter_checkpoint_path: Path | None,
+    session_manager: SessionManager,
 ) -> None:
     for line in doctor_report(
         data_path,
-        work_checkpoint_path,
+        target,
         starter_checkpoint_path,
+        session_manager,
     ):
         print(line)
 
@@ -827,21 +1032,48 @@ def train_and_save(
     trainer.save(checkpoint_path, data_path)
 
 
-class BaseShell:
-    prompt = "> "
+def describe_start_source(target: RunTarget, source_checkpoint_path: Path | None) -> str:
+    if source_checkpoint_path is None:
+        return "a fresh random model"
+    starter_checkpoint_path = resolve_starter_checkpoint_path()
+    if starter_checkpoint_path is not None and source_checkpoint_path == starter_checkpoint_path:
+        return "the bundled starter checkpoint"
+    if target.managed and source_checkpoint_path == target.checkpoint_path:
+        return f"session '{target.session_name}'"
+    return f"the checkpoint at {source_checkpoint_path}"
+
+
+class InteractiveShell:
+    prompt = "textgen> "
 
     def __init__(
         self,
         trainer: TextGeneratorTrainer,
         data_path: Path,
-        checkpoint_path: Path,
+        run_target: RunTarget,
+        session_manager: SessionManager,
+        *,
+        allow_unsafe_checkpoint: bool = False,
+        source_checkpoint_path: Path | None = None,
     ) -> None:
         self.trainer = trainer
         self.data_path = data_path
-        self.checkpoint_path = checkpoint_path
+        self.run_target = run_target
+        self.session_manager = session_manager
+        self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
+        self.source_checkpoint_path = source_checkpoint_path
 
     def intro_lines(self) -> list[str]:
-        return []
+        if self.run_target.managed:
+            target_line = f"Current session: {self.run_target.session_name}"
+        else:
+            target_line = f"Explicit checkpoint target: {self.run_target.checkpoint_path}"
+        return [
+            "Shakespeare text lab",
+            target_line,
+            f"Starting from {describe_start_source(self.run_target, self.source_checkpoint_path)}.",
+            "Type 'help' for commands.",
+        ]
 
     def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
         return {
@@ -850,37 +1082,21 @@ class BaseShell:
             "status": self.handle_status,
             "config": self.handle_config,
             "doctor": self.handle_doctor,
+            "session": self.handle_session,
+            "sessions": self.handle_sessions,
+            "train": self.handle_train,
+            "sample": self.handle_sample,
+            "save": self.handle_save,
+            "load": self.handle_load,
+            "rebuild": self.handle_rebuild,
+            "rebuild-model": self.handle_rebuild,
+            "rebuild_model": self.handle_rebuild,
+            "reset": self.handle_reset,
+            "delete-session": self.handle_delete_session,
+            "delete_session": self.handle_delete_session,
             "quit": self.handle_quit,
             "exit": self.handle_quit,
         }
-
-    def get_doctor_starter_checkpoint_path(self) -> Path | None:
-        return None
-
-    def print_help(self) -> None:
-        raise NotImplementedError
-
-    def print_unknown_command(self, command: str) -> None:
-        print(f"Unknown command: {command}")
-
-    def handle_help(self, args: list[str]) -> None:
-        self.print_help()
-
-    def handle_status(self, args: list[str]) -> None:
-        print(self.trainer.status())
-
-    def handle_config(self, args: list[str]) -> None:
-        print(self.trainer.config())
-
-    def handle_doctor(self, args: list[str]) -> None:
-        show_doctor_report(
-            self.data_path,
-            self.checkpoint_path,
-            self.get_doctor_starter_checkpoint_path(),
-        )
-
-    def handle_quit(self, args: list[str]) -> bool:
-        return False
 
     def cmdloop(self) -> None:
         for line in self.intro_lines():
@@ -913,7 +1129,7 @@ class BaseShell:
         args = parts[1:]
         handler = self.command_handlers().get(command)
         if handler is None:
-            self.print_unknown_command(command)
+            print(f"Unknown command: {command}")
             return True
 
         try:
@@ -924,192 +1140,81 @@ class BaseShell:
 
         return result is not False
 
+    def handle_help(self, args: list[str]) -> None:
+        self.print_help()
 
-class StudentShell(BaseShell):
-    prompt = "student> "
+    def handle_status(self, args: list[str]) -> None:
+        print(self.trainer.status())
 
-    def __init__(
-        self,
-        trainer: TextGeneratorTrainer,
-        data_path: Path,
-        checkpoint_path: Path,
-        starter_checkpoint_path: Path | None,
-        source_checkpoint_path: Path | None,
-        allow_unsafe_checkpoint: bool = False,
-    ) -> None:
-        super().__init__(trainer, data_path, checkpoint_path)
-        self.starter_checkpoint_path = starter_checkpoint_path
-        self.source_checkpoint_path = source_checkpoint_path
-        self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
+    def handle_config(self, args: list[str]) -> None:
+        print(self.trainer.config())
 
-    def intro_lines(self) -> list[str]:
-        return [
-            "Student-friendly Shakespeare text lab",
-            f"Starting from {describe_checkpoint_source(self.source_checkpoint_path)}.",
-            "Try: sample 500",
-            "Then: train 100",
-            "Type 'help' for the small command list.",
-        ]
-
-    def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
-        handlers = super().command_handlers()
-        handlers.update(
-            {
-                "sample": self.sample,
-                "train": self.train,
-                "reset": self.handle_reset,
-                "starter": self.handle_reset,
-            }
+    def handle_doctor(self, args: list[str]) -> None:
+        show_doctor_report(
+            self.data_path,
+            self.run_target,
+            resolve_starter_checkpoint_path(),
+            self.session_manager,
         )
-        return handlers
 
-    def get_doctor_starter_checkpoint_path(self) -> Path | None:
-        return self.starter_checkpoint_path
+    def handle_session(self, args: list[str]) -> None:
+        if self.run_target.managed:
+            print(f"Current session: {self.run_target.session_name}")
+            print(f"Checkpoint: {self.run_target.checkpoint_path}")
+        else:
+            print("Current target: explicit checkpoint")
+            print(f"Checkpoint: {self.run_target.checkpoint_path}")
 
-    def print_unknown_command(self, command: str) -> None:
-        print(f"Unknown command: {command}")
-        print("Type 'help' to see the student command list.")
+    def handle_sessions(self, args: list[str]) -> None:
+        session_names = self.session_manager.list_sessions()
+        if not session_names:
+            print("No managed sessions found.")
+            return
 
-    def train(self, args: list[str]) -> None:
-        steps = STUDENT_DEFAULT_TRAIN_STEPS
-        if args:
-            steps = int(args[0])
+        for name in session_names:
+            tags: list[str] = []
+            if self.run_target.managed and self.run_target.session_name == name:
+                tags.extend(["current", "locked"])
+            elif self.session_manager.is_locked(name):
+                tags.append("locked")
+            if tags:
+                print(f"{name} ({', '.join(tags)})")
+            else:
+                print(name)
+
+    def handle_train(self, args: list[str]) -> None:
+        steps = int(args[0]) if args else DEFAULT_SHELL_TRAIN_STEPS
         if steps <= 0:
             raise ValueError("steps must be a positive integer")
-        if steps > STUDENT_MAX_TRAIN_STEPS:
-            raise ValueError(
-                f"steps is capped at {STUDENT_MAX_TRAIN_STEPS} in student mode to keep runs manageable"
-            )
-
         train_and_save(
             self.trainer,
             steps=steps,
             data_path=self.data_path,
-            checkpoint_path=self.checkpoint_path,
+            checkpoint_path=self.run_target.checkpoint_path,
         )
-        self.source_checkpoint_path = self.checkpoint_path
-        print(f"Saved your progress to {self.checkpoint_path}")
+        self.source_checkpoint_path = self.run_target.checkpoint_path
 
-    def sample(self, args: list[str]) -> None:
-        length, prompt = parse_shell_sample_args(
-            args,
-            default_length=STUDENT_DEFAULT_SAMPLE_LENGTH,
-        )
+    def handle_sample(self, args: list[str]) -> None:
+        length, prompt = parse_shell_sample_args(args, default_length=DEFAULT_SHELL_SAMPLE_LENGTH)
         if length <= 0:
             raise ValueError("sample length must be a positive integer")
-        if length > STUDENT_MAX_SAMPLE_LENGTH:
-            raise ValueError(
-                f"sample length is capped at {STUDENT_MAX_SAMPLE_LENGTH} characters in student mode"
-            )
-
         run_sample_command(
             self.trainer,
             prompt=prompt,
             length=length,
         )
 
-    def handle_reset(self, args: list[str]) -> None:
-        self.reset_to_fresh()
+    def handle_save(self, args: list[str]) -> None:
+        if len(args) > 1:
+            raise ValueError("Usage: save [path]")
+        path = resolve_checkpoint_argument(args[0]) if args else self.run_target.checkpoint_path
+        if path == self.run_target.checkpoint_path:
+            self.trainer.save(path, self.data_path)
+            return
+        with acquire_exclusive_lock(explicit_checkpoint_lock_path(path), f"Checkpoint {path}"):
+            self.trainer.save(path, self.data_path)
 
-    def reset_to_fresh(self) -> None:
-        checkpoint_path = self.checkpoint_path.expanduser().resolve()
-        managed_checkpoint_path = student_checkpoint_path()
-        if checkpoint_path != managed_checkpoint_path:
-            raise ValueError("Student reset can only clear the managed local checkpoint file.")
-
-        if checkpoint_path.exists():
-            checkpoint_path.unlink()
-        self.trainer = build_new_trainer(
-            self.data_path,
-            context_size=self.trainer.corpus.context_size,
-            embed_dim=self.trainer.model.embed_dim,
-            hidden_dim=self.trainer.model.hidden_dim,
-            batch_size=self.trainer.batch_size,
-            learning_rate=self.trainer.learning_rate,
-            grad_clip=self.trainer.grad_clip,
-            seed=self.trainer.seed,
-        )
-        self.source_checkpoint_path = None
-        print("Reset complete. You are back to a fresh random model with no saved progress.")
-
-    @staticmethod
-    def print_help() -> None:
-        print("Commands:")
-        print("  help                     Show this message")
-        print("  sample [len] [prompt]    Generate text from the current model")
-        print("  train [steps]            Train a little more and autosave")
-        print(
-            f"                           Student mode caps: sample <= {STUDENT_MAX_SAMPLE_LENGTH},"
-            f" train <= {STUDENT_MAX_TRAIN_STEPS}"
-        )
-        print("  status                   Estimate current train/validation loss")
-        print("  config                   Show the current settings")
-        print("  reset                    Go back to a fresh untrained model")
-        print("  doctor                   Check whether the package looks ready to use")
-        print("  quit                     Exit the shell")
-
-
-class TrainingShell(BaseShell):
-    prompt = "textgen> "
-
-    def __init__(
-        self,
-        trainer: TextGeneratorTrainer,
-        data_path: Path,
-        checkpoint_path: Path,
-        allow_unsafe_checkpoint: bool = False,
-    ) -> None:
-        super().__init__(trainer, data_path, checkpoint_path)
-        self.allow_unsafe_checkpoint = allow_unsafe_checkpoint
-
-    def intro_lines(self) -> list[str]:
-        return [
-            "Interactive text-generator shell",
-            "Type 'help' for commands.",
-        ]
-
-    def command_handlers(self) -> dict[str, Callable[[list[str]], bool | None]]:
-        handlers = super().command_handlers()
-        handlers.update(
-            {
-                "train": self.train,
-                "sample": self.sample,
-                "save": self.save,
-                "load": self.load,
-                "rebuild": self.handle_rebuild,
-                "rebuild-model": self.handle_rebuild,
-                "rebuild_model": self.handle_rebuild,
-                "clear-models": self.handle_clear_models,
-                "clear_models": self.handle_clear_models,
-            }
-        )
-        return handlers
-
-    def get_doctor_starter_checkpoint_path(self) -> Path | None:
-        return resolve_starter_checkpoint_path()
-
-    def train(self, args: list[str]) -> None:
-        steps = int(args[0]) if args else 500
-        train_and_save(
-            self.trainer,
-            steps=steps,
-            data_path=self.data_path,
-            checkpoint_path=self.checkpoint_path,
-        )
-
-    def sample(self, args: list[str]) -> None:
-        length, prompt = parse_shell_sample_args(args, default_length=300)
-        run_sample_command(
-            self.trainer,
-            prompt=prompt,
-            length=length,
-        )
-
-    def save(self, args: list[str]) -> None:
-        path = Path(args[0]) if args else self.checkpoint_path
-        self.trainer.save(path, self.data_path)
-
-    def load(self, args: list[str]) -> None:
+    def handle_load(self, args: list[str]) -> None:
         allow_unsafe_checkpoint = self.allow_unsafe_checkpoint
         path_args: list[str] = []
         for arg in args:
@@ -1119,13 +1224,21 @@ class TrainingShell(BaseShell):
                 path_args.append(arg)
         if len(path_args) > 1:
             raise ValueError("Usage: load [path] [--unsafe]")
-        path = Path(path_args[0]) if path_args else self.checkpoint_path
-        self.trainer = TextGeneratorTrainer.load(
-            path,
-            self.trainer.corpus,
-            self.data_path,
-            allow_unsafe_checkpoint=allow_unsafe_checkpoint,
-        )
+        path = resolve_checkpoint_argument(path_args[0]) if path_args else self.run_target.checkpoint_path
+        if path == self.run_target.checkpoint_path:
+            self.trainer = TextGeneratorTrainer.load(
+                path,
+                self.trainer.corpus,
+                allow_unsafe_checkpoint=allow_unsafe_checkpoint,
+            )
+        else:
+            with acquire_exclusive_lock(explicit_checkpoint_lock_path(path), f"Checkpoint {path}"):
+                self.trainer = TextGeneratorTrainer.load(
+                    path,
+                    self.trainer.corpus,
+                    allow_unsafe_checkpoint=allow_unsafe_checkpoint,
+                )
+        self.source_checkpoint_path = path
         print(f"Loaded checkpoint from {path}")
 
     def handle_rebuild(self, args: list[str]) -> None:
@@ -1144,50 +1257,36 @@ class TrainingShell(BaseShell):
             embed_dim=int(args[4]) if len(args) == 5 else None,
         )
 
-    def handle_clear_models(self, args: list[str]) -> None:
-        self.clear_saved_models()
+    def handle_reset(self, args: list[str]) -> None:
+        if not self.run_target.managed or self.run_target.session_name is None:
+            raise ValueError("reset is only available for managed sessions.")
 
-    def clear_saved_models(self) -> None:
-        checkpoint_path = self.checkpoint_path.expanduser().resolve()
-        managed_checkpoint_dir = DEFAULT_CHECKPOINT_PATH.expanduser().resolve().parent
-        protected_paths = {
-            path
-            for path in starter_checkpoint_candidates()
-            if path.exists()
-        }
+        checkpoint_path = self.run_target.checkpoint_path
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        self.trainer = build_new_trainer(
+            self.data_path,
+            context_size=self.trainer.corpus.context_size,
+            embed_dim=self.trainer.model.embed_dim,
+            hidden_dim=self.trainer.model.hidden_dim,
+            batch_size=self.trainer.batch_size,
+            learning_rate=self.trainer.learning_rate,
+            grad_clip=self.trainer.grad_clip,
+            seed=self.trainer.seed,
+        )
+        self.source_checkpoint_path = None
+        print(
+            f"Reset complete. Session '{self.run_target.session_name}' is back to a fresh random model."
+        )
 
-        if checkpoint_path.is_relative_to(managed_checkpoint_dir):
-            if not managed_checkpoint_dir.exists():
-                print(f"No checkpoint directory found at {managed_checkpoint_dir}")
-                return
+    def handle_delete_session(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise ValueError("Usage: delete-session <name>")
+        current_session = self.run_target.session_name if self.run_target.managed else None
+        print(self.session_manager.delete_session(args[0], current_session=current_session))
 
-            model_paths = sorted(
-                path
-                for path in managed_checkpoint_dir.rglob("*")
-                if path.is_file() and is_checkpoint_file(path)
-                and path.resolve() not in protected_paths
-            )
-            if not model_paths:
-                print(f"No removable saved models found in {managed_checkpoint_dir}")
-                return
-
-            for path in model_paths:
-                path.unlink()
-
-            print(f"Deleted {len(model_paths)} saved model(s) from {managed_checkpoint_dir}")
-            return
-
-        if not checkpoint_path.exists():
-            print(f"No saved model found at {checkpoint_path}")
-            return
-
-        if not checkpoint_path.is_relative_to(managed_checkpoint_dir):
-            raise ValueError("Refusing to delete checkpoints outside the managed checkpoints directory.")
-        if checkpoint_path in protected_paths:
-            raise ValueError("Refusing to delete the bundled starter checkpoint.")
-
-        checkpoint_path.unlink()
-        print(f"Deleted checkpoint {checkpoint_path}")
+    def handle_quit(self, args: list[str]) -> bool:
+        return False
 
     def rebuild_model(
         self,
@@ -1240,7 +1339,9 @@ class TrainingShell(BaseShell):
         print("  help                     Show this message")
         print("  config                   Show current model/training settings")
         print("  status                   Estimate current train/validation loss")
-        print("  doctor                   Check whether the package looks ready to use")
+        print("  doctor                   Check package and session setup")
+        print("  session                  Show the current active session or checkpoint")
+        print("  sessions                 List managed sessions")
         print("  train [steps]            Train for more steps, then autosave")
         print("  sample [len] [prompt]    Generate text, optionally seeded by a prompt")
         print("  save [path]              Save a checkpoint")
@@ -1252,54 +1353,52 @@ class TrainingShell(BaseShell):
             "                           Limits: context_size >= 1, hidden_dim >= 1, "
             "batch_size >= 1, embed_dim >= 1, lr > 0"
         )
-        print("                           No hard max is enforced, but larger context/hidden/batch/embed")
-        print("                           values use more memory and train slower; very large lr can destabilize training")
-        print("  clear-models             Delete saved progress checkpoints in checkpoints/")
-        print("                           The bundled starter checkpoint is preserved.")
+        print("  reset                    Clear the current managed session and start fresh")
+        print("  delete-session <name>    Delete a managed session that is not current or locked")
         print("  quit                     Exit the shell")
 
 
-def build_trainer_from_args(args: argparse.Namespace) -> TextGeneratorTrainer:
-    data_path = Path(args.data).expanduser().resolve()
-    if args.command == "sample":
-        if not args.fresh:
-            if args.checkpoint is None:
-                raise FileNotFoundError(
-                    "No checkpoint specified for sample. "
-                    "Pass --checkpoint to sample a saved model, or --fresh to sample from a new random model."
-                )
-            checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
-            if checkpoint_path.exists():
-                return load_trainer_from_checkpoint(
-                    checkpoint_path,
-                    data_path=data_path,
-                    context_size=args.context_size,
-                    allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
-                )
-            raise FileNotFoundError(
-                f"No checkpoint found at {checkpoint_path}. "
-                "Train a model first, or pass --fresh to sample from a new random model."
-            )
+def resolve_target_from_args(args: argparse.Namespace, session_manager: SessionManager) -> RunTarget | None:
+    if args.checkpoint is not None:
+        return session_manager.target_for_checkpoint(resolve_checkpoint_argument(args.checkpoint))
+    if args.session is not None:
+        return session_manager.target_for_session(args.session)
+    return None
 
-    checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
-    if checkpoint_path.exists() and not args.fresh:
-        return load_trainer_from_checkpoint(
-            checkpoint_path,
-            data_path=data_path,
-            context_size=args.context_size,
-            allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
+
+def resolve_shell_target(args: argparse.Namespace, session_manager: SessionManager) -> RunTarget:
+    target = resolve_target_from_args(args, session_manager)
+    if target is not None:
+        return target
+    session_name = session_manager.choose_session_interactively()
+    return session_manager.target_for_session(session_name)
+
+
+def require_noninteractive_target(
+    args: argparse.Namespace,
+    *,
+    session_manager: SessionManager,
+    command_name: str,
+) -> RunTarget:
+    target = resolve_target_from_args(args, session_manager)
+    if target is not None:
+        return target
+
+    if command_name == "train":
+        raise ValueError(
+            "train requires --session or --checkpoint so it knows where to save progress."
         )
-
-    return build_new_trainer(
-        data_path,
-        context_size=args.context_size,
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        grad_clip=args.grad_clip,
-        seed=args.seed,
+    raise ValueError(
+        "sample requires --session, --checkpoint, or --fresh."
     )
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return ["shell"]
+    if argv[0].startswith("-"):
+        return ["shell", *argv]
+    return argv
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -1311,6 +1410,7 @@ def make_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data", default=str(DEFAULT_DATA_PATH))
     common.add_argument("--checkpoint", default=None)
+    common.add_argument("--session", default=None)
     common.add_argument("--context-size", type=parse_positive_int, default=48)
     common.add_argument("--embed-dim", type=parse_positive_int, default=24)
     common.add_argument("--hidden-dim", type=parse_positive_int, default=192)
@@ -1329,14 +1429,7 @@ def make_parser() -> argparse.ArgumentParser:
         help="Start from a new model even if a checkpoint already exists",
     )
 
-    student_parser = subparsers.add_parser(
-        "student",
-        parents=[common],
-        help="Student-friendly interactive shell",
-    )
-    student_parser.set_defaults(command="student")
-
-    shell_parser = subparsers.add_parser("shell", parents=[common], help="Teacher/advanced interactive shell")
+    shell_parser = subparsers.add_parser("shell", parents=[common], help="Interactive shell")
     shell_parser.set_defaults(command="shell")
 
     train_parser = subparsers.add_parser("train", parents=[common], help="Train for a fixed number of steps")
@@ -1357,72 +1450,108 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = make_parser()
-    argv = sys.argv[1:]
-    if not argv:
-        argv = ["student"]
+    argv = normalize_argv(sys.argv[1:])
     args = parser.parse_args(argv)
 
+    session_manager = SessionManager()
+    migration_messages = session_manager.migrate_legacy_checkpoint()
+    for message in migration_messages:
+        print(message)
+
     data_path = Path(args.data).expanduser().resolve()
-    checkpoint_path = resolve_checkpoint_argument(args.checkpoint, DEFAULT_CHECKPOINT_PATH)
 
     if args.command == "doctor":
+        target = resolve_target_from_args(args, session_manager)
         show_doctor_report(
             data_path,
-            checkpoint_path,
+            target,
             resolve_starter_checkpoint_path(),
+            session_manager,
         )
         return 0
-
-    if args.command == "student":
-        try:
-            trainer, source_checkpoint_path = build_student_trainer(args)
-        except (FileNotFoundError, ValueError) as exc:
-            parser.exit(2, f"{parser.prog}: error: {exc}\n")
-        shell = StudentShell(
-            trainer=trainer,
-            data_path=data_path,
-            checkpoint_path=checkpoint_path,
-            starter_checkpoint_path=resolve_starter_checkpoint_path(),
-            source_checkpoint_path=source_checkpoint_path,
-            allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
-        )
-        shell.cmdloop()
-        return 0
-
-    try:
-        trainer = build_trainer_from_args(args)
-    except (FileNotFoundError, ValueError) as exc:
-        parser.exit(2, f"{parser.prog}: error: {exc}\n")
 
     if args.command == "shell":
-        shell = TrainingShell(
-            trainer,
-            data_path=data_path,
-            checkpoint_path=checkpoint_path,
-            allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
-        )
-        shell.cmdloop()
+        try:
+            target = resolve_shell_target(args, session_manager)
+            with acquire_target_lock(target):
+                trainer, source_checkpoint_path = build_trainer_for_target(
+                    args,
+                    data_path=data_path,
+                    target=target,
+                )
+                shell = InteractiveShell(
+                    trainer=trainer,
+                    data_path=data_path,
+                    run_target=target,
+                    session_manager=session_manager,
+                    allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
+                    source_checkpoint_path=source_checkpoint_path,
+                )
+                shell.cmdloop()
+        except (EOFError, FileNotFoundError, SessionError, SessionLockError, ValueError) as exc:
+            parser.exit(2, f"{parser.prog}: error: {exc}\n")
         return 0
 
     if args.command == "train":
-        train_and_save(
-            trainer,
-            steps=args.steps,
-            data_path=data_path,
-            checkpoint_path=checkpoint_path,
-            log_every=args.log_every,
-        )
-        print(trainer.status())
+        try:
+            target = require_noninteractive_target(
+                args,
+                session_manager=session_manager,
+                command_name="train",
+            )
+            with acquire_target_lock(target):
+                trainer, _ = build_trainer_for_target(
+                    args,
+                    data_path=data_path,
+                    target=target,
+                )
+                train_and_save(
+                    trainer,
+                    steps=args.steps,
+                    data_path=data_path,
+                    checkpoint_path=target.checkpoint_path,
+                    log_every=args.log_every,
+                )
+                print(trainer.status())
+        except (FileNotFoundError, SessionError, SessionLockError, ValueError) as exc:
+            parser.exit(2, f"{parser.prog}: error: {exc}\n")
         return 0
 
     if args.command == "sample":
-        run_sample_command(
-            trainer,
-            prompt=args.prompt,
-            length=args.length,
-            temperature=args.temperature,
-            top_k=args.top_k,
-        )
+        try:
+            if args.fresh:
+                trainer = build_new_trainer_from_args(args, data_path)
+            else:
+                target = require_noninteractive_target(
+                    args,
+                    session_manager=session_manager,
+                    command_name="sample",
+                )
+                with acquire_target_lock(target):
+                    trainer, _ = build_trainer_for_target(
+                        args,
+                        data_path=data_path,
+                        target=target,
+                        require_existing_checkpoint=True,
+                    )
+                    run_sample_command(
+                        trainer,
+                        prompt=args.prompt,
+                        length=args.length,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                    )
+                    return 0
+
+            run_sample_command(
+                trainer,
+                prompt=args.prompt,
+                length=args.length,
+                temperature=args.temperature,
+                top_k=args.top_k,
+            )
+        except (FileNotFoundError, SessionError, SessionLockError, ValueError) as exc:
+            parser.exit(2, f"{parser.prog}: error: {exc}\n")
         return 0
 
     parser.print_help()

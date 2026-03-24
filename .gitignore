@@ -2,11 +2,14 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+checkpoints/*.lock
 checkpoints/*.pkl
 checkpoints/*.pickle
 checkpoints/*.npz
+checkpoints/**/*.lock
 checkpoints/**/*.pkl
 checkpoints/**/*.pickle
 checkpoints/**/*.npz
+checkpoints/sessions/
 checkpoints/.DS_Store
 !checkpoints/starter_model.npz
