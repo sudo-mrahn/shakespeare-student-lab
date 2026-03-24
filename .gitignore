@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+checkpoints/*.pkl
+checkpoints/*.pickle
+checkpoints/*.npz
+checkpoints/**/*.pkl
+checkpoints/**/*.pickle
+checkpoints/**/*.npz
+checkpoints/.DS_Store
+!checkpoints/starter_model.npz
