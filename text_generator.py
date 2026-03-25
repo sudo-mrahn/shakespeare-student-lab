@@ -13,6 +13,7 @@ import shutil
 import sys
 import unicodedata
 import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -438,6 +439,8 @@ class CharMLP:
             "m": {name: np.zeros_like(value) for name, value in self.params.items()},
             "v": {name: np.zeros_like(value) for name, value in self.params.items()},
         }
+        self._scratch = {name: np.empty_like(value) for name, value in self.params.items()}
+        self._denom_scratch = {name: np.empty_like(value) for name, value in self.params.items()}
 
     def forward(self, x: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         embedding = self.params["E"][x]
@@ -487,8 +490,7 @@ class CharMLP:
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             dflat = dhidden_linear @ self.params["W1"].T
         dembedding = dflat.reshape(batch_size, self.context_size, self.embed_dim)
-        grads["E"] = np.zeros_like(self.params["E"])
-        np.add.at(grads["E"], cache["x"], dembedding)
+        grads["E"] = self._accumulate_embedding_grads(cache["x"], dembedding)
 
         if not np.isfinite(loss):
             raise FloatingPointError("Loss became non-finite during training.")
@@ -497,6 +499,23 @@ class CharMLP:
                 raise FloatingPointError(f"Gradient {name} became non-finite during training.")
 
         return loss, grads
+
+    def _accumulate_embedding_grads(
+        self,
+        token_ids: np.ndarray,
+        embedding_grads: np.ndarray,
+    ) -> np.ndarray:
+        flat_token_ids = token_ids.reshape(-1)
+        flat_embedding_grads = embedding_grads.reshape(-1, self.embed_dim)
+        grad = np.zeros_like(self.params["E"])
+        if flat_token_ids.size == 0:
+            return grad
+
+        order = np.argsort(flat_token_ids, kind="stable")
+        sorted_token_ids = flat_token_ids[order]
+        unique_token_ids, starts = np.unique(sorted_token_ids, return_index=True)
+        grad[unique_token_ids] = np.add.reduceat(flat_embedding_grads[order], starts, axis=0)
+        return grad
 
     def apply_grads(
         self,
@@ -514,17 +533,39 @@ class CharMLP:
 
         self.opt_state["step"] += 1
         step = self.opt_state["step"]
+        m_state = self.opt_state["m"]
+        v_state = self.opt_state["v"]
+        beta1_correction = 1.0 - beta1**step
+        beta2_correction = 1.0 - beta2**step
+        one_minus_beta1 = 1.0 - beta1
+        one_minus_beta2 = 1.0 - beta2
 
         for name, param in self.params.items():
-            grad = grads[name] * clip_scale
-            self.opt_state["m"][name] = beta1 * self.opt_state["m"][name] + (1.0 - beta1) * grad
-            self.opt_state["v"][name] = beta2 * self.opt_state["v"][name] + (1.0 - beta2) * (
-                grad * grad
-            )
+            grad = grads[name]
+            m = m_state[name]
+            v = v_state[name]
+            scratch = self._scratch[name]
+            denom = self._denom_scratch[name]
 
-            m_hat = self.opt_state["m"][name] / (1.0 - beta1**step)
-            v_hat = self.opt_state["v"][name] / (1.0 - beta2**step)
-            param -= learning_rate * m_hat / (np.sqrt(v_hat) + eps)
+            if clip_scale != 1.0:
+                np.multiply(grad, clip_scale, out=scratch)
+                grad = scratch
+
+            m *= beta1
+            np.multiply(grad, one_minus_beta1, out=denom)
+            m += denom
+
+            np.square(grad, out=scratch)
+            scratch *= one_minus_beta2
+            v *= beta2
+            v += scratch
+
+            np.divide(v, beta2_correction, out=denom)
+            np.sqrt(denom, out=denom)
+            denom += eps
+            np.divide(m, beta1_correction, out=scratch)
+            scratch /= denom
+            param -= learning_rate * scratch
             if not np.all(np.isfinite(param)):
                 raise FloatingPointError(f"Parameter {name} became non-finite during training.")
 
@@ -608,6 +649,8 @@ class CharMLP:
             "m": {name: value.copy() for name, value in payload["opt_state"]["m"].items()},
             "v": {name: value.copy() for name, value in payload["opt_state"]["v"].items()},
         }
+        model._scratch = {name: np.empty_like(value) for name, value in model.params.items()}
+        model._denom_scratch = {name: np.empty_like(value) for name, value in model.params.items()}
         return model
 
 
@@ -636,6 +679,7 @@ class TextGeneratorTrainer:
         self.seed = seed
         self.train_steps = 0
         self.rng = np.random.default_rng(seed)
+        self._batch_offsets = np.arange(self.corpus.context_size, dtype=np.int32)
 
     def batch(self, split: str = "train") -> tuple[np.ndarray, np.ndarray]:
         if split == "train":
@@ -648,8 +692,7 @@ class TextGeneratorTrainer:
             raise ValueError(f"Unknown split: {split}")
 
         starts = self.rng.integers(0, data_length, size=self.batch_size, endpoint=False)
-        offsets = np.arange(self.corpus.context_size, dtype=np.int32)
-        x = padded[starts[:, None] + offsets]
+        x = padded[starts[:, None] + self._batch_offsets]
         y = padded[starts + self.corpus.context_size]
         return x.astype(np.int32, copy=False), y.astype(np.int32, copy=False)
 
@@ -661,7 +704,8 @@ class TextGeneratorTrainer:
         if log_every <= 0:
             raise ValueError("log_every must be a positive integer.")
 
-        recent_losses: list[float] = []
+        recent_losses: deque[float] = deque(maxlen=log_every)
+        recent_loss_sum = 0.0
 
         try:
             for _ in range(steps):
@@ -673,10 +717,13 @@ class TextGeneratorTrainer:
                     grad_clip=self.grad_clip,
                 )
                 self.train_steps += 1
+                if len(recent_losses) == log_every:
+                    recent_loss_sum -= recent_losses[0]
                 recent_losses.append(loss)
+                recent_loss_sum += loss
 
                 if self.train_steps % log_every == 0:
-                    avg_loss = sum(recent_losses[-log_every:]) / min(len(recent_losses), log_every)
+                    avg_loss = recent_loss_sum / len(recent_losses)
                     val_loss = self.estimate_loss("val", num_batches=4)
                     print(
                         f"step {self.train_steps:>7} | train_loss={avg_loss:.4f} "
@@ -749,7 +796,7 @@ class TextGeneratorTrainer:
             archive_items[f"opt_v__{name}"] = payload["model"]["opt_state"]["v"][name]
 
         with path.open("wb") as handle:
-            np.savez_compressed(handle, **archive_items)
+            np.savez(handle, **archive_items)
         print(f"Saved checkpoint to {path}")
 
     @staticmethod

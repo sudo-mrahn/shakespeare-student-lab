@@ -178,6 +178,100 @@ class LogEveryValidationTests(unittest.TestCase):
 
         self.assertEqual(args.log_every, 5)
 
+    def test_train_logs_recent_losses_from_current_call(self) -> None:
+        trainer = make_trainer()
+        trainer.train_steps = 1
+        x = np.zeros((trainer.batch_size, trainer.corpus.context_size), dtype=np.int32)
+        y = np.zeros(trainer.batch_size, dtype=np.int32)
+        losses_and_norms = [(1.0, 0.5), (2.0, 0.6), (3.0, 0.7)]
+
+        with (
+            mock.patch.object(trainer, "batch", return_value=(x, y)),
+            mock.patch.object(trainer.model, "train_step", side_effect=losses_and_norms),
+            mock.patch.object(trainer, "estimate_loss", return_value=9.0) as estimate_loss,
+            redirect_stdout(io.StringIO()) as stdout,
+        ):
+            trainer.train(steps=3, log_every=2)
+
+        self.assertEqual(
+            stdout.getvalue().strip().splitlines(),
+            [
+                "step       2 | train_loss=1.0000 | val_loss=9.0000 | grad_norm=0.5000",
+                "step       4 | train_loss=2.5000 | val_loss=9.0000 | grad_norm=0.7000",
+            ],
+        )
+        self.assertEqual(
+            estimate_loss.call_args_list,
+            [mock.call("val", num_batches=4), mock.call("val", num_batches=4)],
+        )
+
+
+class ApplyGradsTests(unittest.TestCase):
+    def test_apply_grads_matches_reference_adam_update(self) -> None:
+        model = text_generator.CharMLP(vocab_size=3, context_size=2, embed_dim=2, hidden_dim=2, seed=7)
+        model.params = {
+            "E": np.array([[0.1, -0.2], [0.3, 0.4], [-0.5, 0.6]], dtype=np.float32),
+            "W1": np.array(
+                [[0.2, -0.1], [0.0, 0.3], [-0.4, 0.5], [0.6, -0.7]], dtype=np.float32
+            ),
+            "b1": np.array([0.05, -0.15], dtype=np.float32),
+            "W2": np.array([[0.25, -0.35, 0.45], [-0.55, 0.65, -0.75]], dtype=np.float32),
+            "b2": np.array([0.01, -0.02, 0.03], dtype=np.float32),
+        }
+        model.opt_state = {
+            "step": 0,
+            "m": {name: np.zeros_like(value) for name, value in model.params.items()},
+            "v": {name: np.zeros_like(value) for name, value in model.params.items()},
+        }
+        grads = {
+            "E": np.array([[0.02, -0.01], [0.03, 0.04], [-0.05, 0.06]], dtype=np.float32),
+            "W1": np.array(
+                [[0.01, -0.02], [0.03, 0.04], [-0.05, 0.06], [0.07, -0.08]], dtype=np.float32
+            ),
+            "b1": np.array([0.02, -0.03], dtype=np.float32),
+            "W2": np.array([[0.01, -0.02, 0.03], [-0.04, 0.05, -0.06]], dtype=np.float32),
+            "b2": np.array([0.01, -0.02, 0.03], dtype=np.float32),
+        }
+        initial_params = {name: value.copy() for name, value in model.params.items()}
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        learning_rate = 1e-2
+        grad_clip = 10.0
+
+        expected_m = {name: np.zeros_like(value) for name, value in grads.items()}
+        expected_v = {name: np.zeros_like(value) for name, value in grads.items()}
+        expected_params = {name: value.copy() for name, value in initial_params.items()}
+        expected_norm = float(np.sqrt(sum(np.sum(grad**2) for grad in grads.values())))
+        step = 1
+
+        for name, grad in grads.items():
+            expected_m[name] = beta1 * expected_m[name] + (1.0 - beta1) * grad
+            expected_v[name] = beta2 * expected_v[name] + (1.0 - beta2) * (grad * grad)
+            m_hat = expected_m[name] / (1.0 - beta1**step)
+            v_hat = expected_v[name] / (1.0 - beta2**step)
+            expected_params[name] -= learning_rate * m_hat / (np.sqrt(v_hat) + eps)
+
+        observed_norm = model.apply_grads(
+            {name: value.copy() for name, value in grads.items()},
+            learning_rate=learning_rate,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            grad_clip=grad_clip,
+        )
+
+        self.assertAlmostEqual(observed_norm, expected_norm)
+        self.assertEqual(model.opt_state["step"], step)
+        for name in expected_params:
+            np.testing.assert_allclose(model.params[name], expected_params[name], rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(
+                model.opt_state["m"][name], expected_m[name], rtol=1e-6, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                model.opt_state["v"][name], expected_v[name], rtol=1e-6, atol=1e-6
+            )
+
 
 class PromptSanitizationTests(unittest.TestCase):
     def test_sanitize_prompt_normalizes_quotes_and_drops_unknown_chars(self) -> None:
@@ -350,6 +444,45 @@ class CheckpointSafetyTests(unittest.TestCase):
 
             self.assertTrue(zipfile.is_zipfile(checkpoint_path))
 
+    def test_save_uses_uncompressed_npz_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            checkpoint_path = root / "model.npz"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+
+            trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+            trainer.save(checkpoint_path, data_path)
+
+            with zipfile.ZipFile(checkpoint_path) as archive:
+                self.assertTrue(archive.infolist())
+                self.assertTrue(
+                    all(info.compress_type == zipfile.ZIP_STORED for info in archive.infolist())
+                )
+
+    def test_safe_checkpoint_round_trips_after_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            checkpoint_path = root / "model.npz"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+
+            trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+            trainer.train_steps = 12
+            trainer.save(checkpoint_path, data_path)
+
+            corpus = text_generator.Corpus(
+                text=data_path.read_text(encoding="utf-8"),
+                context_size=trainer.corpus.context_size,
+            )
+            loaded = text_generator.TextGeneratorTrainer.load(checkpoint_path, corpus)
+
+            self.assertEqual(loaded.train_steps, 12)
+            self.assertEqual(loaded.batch_size, trainer.batch_size)
+            self.assertEqual(loaded.learning_rate, trainer.learning_rate)
+            for name, param in trainer.model.params.items():
+                np.testing.assert_allclose(loaded.model.params[name], param)
+
     def test_checkpoint_load_rejects_changed_corpus_with_same_charset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -446,6 +579,28 @@ class CheckpointSafetyTests(unittest.TestCase):
                     changed_corpus,
                     allow_unsafe_checkpoint=True,
                 )
+
+
+class EmbeddingGradientAccumulationTests(unittest.TestCase):
+    def test_embedding_grad_accumulation_matches_add_at_reference(self) -> None:
+        trainer = make_trainer_for_text("abbaabba\n")
+        x, y = trainer.batch("train")
+        logits, cache = trainer.model.forward(x)
+        probs = trainer.model._softmax(logits)
+        batch_size = len(y)
+        dlogits = probs
+        dlogits[np.arange(batch_size), y] -= 1.0
+        dlogits /= batch_size
+        dhidden = dlogits @ trainer.model.params["W2"].T
+        dhidden_linear = dhidden * (1.0 - cache["hidden"] ** 2)
+        dflat = dhidden_linear @ trainer.model.params["W1"].T
+        dembedding = dflat.reshape(batch_size, trainer.model.context_size, trainer.model.embed_dim)
+
+        reference = np.zeros_like(trainer.model.params["E"])
+        np.add.at(reference, cache["x"], dembedding)
+        accumulated = trainer.model._accumulate_embedding_grads(cache["x"], dembedding)
+
+        np.testing.assert_allclose(accumulated, reference, rtol=1e-6, atol=1e-6)
 
 
 class LockingTests(unittest.TestCase):
