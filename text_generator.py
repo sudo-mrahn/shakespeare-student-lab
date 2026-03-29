@@ -1090,6 +1090,35 @@ def describe_start_source(target: RunTarget, source_checkpoint_path: Path | None
     return f"the checkpoint at {source_checkpoint_path}"
 
 
+def configure_shell_readline() -> bool:
+    try:
+        import readline
+    except ImportError:
+        return False
+
+    backend = getattr(readline, "backend", "")
+    if not backend:
+        doc = (getattr(readline, "__doc__", "") or "").lower()
+        backend = "editline" if "libedit" in doc else "readline"
+    binding = "bind ^L ed-clear-screen" if backend == "editline" else '"\\C-l": clear-screen'
+    try:
+        readline.parse_and_bind(binding)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def is_clear_screen_request(raw_line: str) -> bool:
+    return "\x0c" in raw_line and raw_line.replace("\x0c", "").strip() == ""
+
+
+def clear_terminal_screen() -> None:
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
 class InteractiveShell:
     prompt = "textgen> "
 
@@ -1146,12 +1175,13 @@ class InteractiveShell:
         }
 
     def cmdloop(self) -> None:
+        configure_shell_readline()
         for line in self.intro_lines():
             print(line)
 
         while True:
             try:
-                line = input(self.prompt).strip()
+                raw_line = input(self.prompt)
             except EOFError:
                 print()
                 break
@@ -1159,6 +1189,11 @@ class InteractiveShell:
                 print()
                 continue
 
+            if is_clear_screen_request(raw_line):
+                clear_terminal_screen()
+                continue
+
+            line = raw_line.strip()
             if not line:
                 continue
 
@@ -1402,6 +1437,7 @@ class InteractiveShell:
         )
         print("  reset                    Clear the current managed session and start fresh")
         print("  delete-session <name>    Delete a managed session that is not current or locked")
+        print("  Ctrl+L                   Clear the screen at the prompt")
         print("  quit                     Exit the shell")
 
 

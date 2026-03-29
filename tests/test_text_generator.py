@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 import zipfile
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
@@ -696,6 +697,38 @@ class InteractiveShellTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()) as stdout:
                     self.assertFalse(shell.execute("quit"))
                 self.assertEqual(stdout.getvalue(), "")
+
+    def test_configure_shell_readline_uses_editline_binding(self) -> None:
+        fake_readline = types.SimpleNamespace(backend="editline", parse_and_bind=mock.Mock())
+
+        with mock.patch.dict(sys.modules, {"readline": fake_readline}):
+            self.assertTrue(text_generator.configure_shell_readline())
+
+        fake_readline.parse_and_bind.assert_called_once_with("bind ^L ed-clear-screen")
+
+    def test_configure_shell_readline_uses_gnu_readline_binding(self) -> None:
+        fake_readline = types.SimpleNamespace(backend="readline", parse_and_bind=mock.Mock())
+
+        with mock.patch.dict(sys.modules, {"readline": fake_readline}):
+            self.assertTrue(text_generator.configure_shell_readline())
+
+        fake_readline.parse_and_bind.assert_called_once_with('"\\C-l": clear-screen')
+
+    def test_cmdloop_clears_screen_when_form_feed_line_is_entered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with (
+                    mock.patch.object(text_generator, "configure_shell_readline", return_value=False),
+                    mock.patch.object(text_generator, "clear_terminal_screen") as clear_terminal_screen,
+                    mock.patch("builtins.input", side_effect=["\x0c", "quit"]),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    shell.cmdloop()
+
+                clear_terminal_screen.assert_called_once_with()
 
     def test_sessions_command_marks_current_and_locked_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
