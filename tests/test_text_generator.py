@@ -681,6 +681,7 @@ class InteractiveShellTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()) as stdout:
                     self.assertTrue(shell.execute("help"))
                 self.assertIn("delete-session <name>", stdout.getvalue())
+                self.assertIn("--context-size", stdout.getvalue())
 
                 with redirect_stdout(io.StringIO()) as stdout:
                     self.assertTrue(shell.execute("status"))
@@ -729,6 +730,77 @@ class InteractiveShellTests(unittest.TestCase):
                     shell.cmdloop()
 
                 clear_terminal_screen.assert_called_once_with()
+
+    def test_rebuild_named_args_update_only_requested_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with redirect_stdout(io.StringIO()) as stdout:
+                    self.assertTrue(shell.execute("rebuild -c=5 -e=6"))
+
+                self.assertIn("context=5", stdout.getvalue())
+                self.assertEqual(shell.trainer.corpus.context_size, 5)
+                self.assertEqual(shell.trainer.model.embed_dim, 6)
+                self.assertEqual(shell.trainer.model.hidden_dim, 8)
+                self.assertEqual(shell.trainer.batch_size, 2)
+                self.assertEqual(shell.trainer.learning_rate, 1e-3)
+
+    def test_rebuild_named_args_support_separate_option_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with redirect_stdout(io.StringIO()):
+                    self.assertTrue(shell.execute("rebuild --learning-rate 0.02 -b 4"))
+
+                self.assertEqual(shell.trainer.corpus.context_size, 3)
+                self.assertEqual(shell.trainer.model.hidden_dim, 8)
+                self.assertEqual(shell.trainer.model.embed_dim, 4)
+                self.assertEqual(shell.trainer.batch_size, 4)
+                self.assertEqual(shell.trainer.learning_rate, 0.02)
+
+    def test_rebuild_positional_form_still_works(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with redirect_stdout(io.StringIO()):
+                    self.assertTrue(shell.execute("rebuild 6 10 0.02"))
+
+                self.assertEqual(shell.trainer.corpus.context_size, 6)
+                self.assertEqual(shell.trainer.model.hidden_dim, 10)
+                self.assertEqual(shell.trainer.learning_rate, 0.02)
+                self.assertEqual(shell.trainer.batch_size, 2)
+                self.assertEqual(shell.trainer.model.embed_dim, 4)
+
+    def test_rebuild_rejects_mixed_positional_and_named_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with redirect_stdout(io.StringIO()) as stdout:
+                    self.assertTrue(shell.execute("rebuild 6 10 0.02 -e=5"))
+
+                self.assertIn("Do not mix positional values", stdout.getvalue())
+                self.assertEqual(shell.trainer.corpus.context_size, 3)
+                self.assertEqual(shell.trainer.model.embed_dim, 4)
+
+    def test_rebuild_rejects_unknown_named_option(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, _, _ = self.make_shell(root=root, managed=True)
+
+                with redirect_stdout(io.StringIO()) as stdout:
+                    self.assertTrue(shell.execute("rebuild -x=5"))
+
+                self.assertIn("Unknown rebuild option", stdout.getvalue())
+                self.assertEqual(shell.trainer.corpus.context_size, 3)
 
     def test_sessions_command_marks_current_and_locked_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

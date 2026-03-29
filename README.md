@@ -54,6 +54,7 @@ session
 sessions
 train 200
 sample 250 "ROMEO:"
+rebuild -c=100 -e=50
 reset
 delete-session old-run
 quit
@@ -61,6 +62,8 @@ quit
 
 Notes:
 
+- `rebuild` accepts named options like `-c=100 -e=50`; unspecified values keep their current settings.
+- The older positional form `rebuild <context_size> <hidden_dim> <learning_rate> [batch_size] [embed_dim]` still works.
 - `reset` only clears the current managed session.
 - `delete-session <name>` refuses the current session and any locked session.
 - `save` and `load` still support manual checkpoint paths for advanced workflows.

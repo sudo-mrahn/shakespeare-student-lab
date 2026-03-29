@@ -1045,6 +1045,114 @@ def parse_shell_sample_args(args: list[str], *, default_length: int) -> tuple[in
     return length, " ".join(prompt_args)
 
 
+REBUILD_OPTION_SPECS: dict[str, tuple[str, Callable[[str], int | float]]] = {
+    "-c": ("context_size", int),
+    "--context-size": ("context_size", int),
+    "-h": ("hidden_dim", int),
+    "--hidden-dim": ("hidden_dim", int),
+    "-lr": ("learning_rate", float),
+    "--learning-rate": ("learning_rate", float),
+    "-b": ("batch_size", int),
+    "--batch-size": ("batch_size", int),
+    "-e": ("embed_dim", int),
+    "--embed-dim": ("embed_dim", int),
+}
+
+
+def rebuild_usage_lines() -> list[str]:
+    return [
+        "Usage: rebuild <context_size> <hidden_dim> <learning_rate> [batch_size] [embed_dim]",
+        "   or: rebuild [-c|--context-size N] [-h|--hidden-dim N] [-lr|--learning-rate X]",
+        "               [-b|--batch-size N] [-e|--embed-dim N]",
+        "       Unspecified named options keep their current values.",
+    ]
+
+
+def print_rebuild_usage() -> None:
+    for line in rebuild_usage_lines():
+        print(line)
+
+
+def rebuild_option_spec(token: str) -> tuple[str, Callable[[str], int | float]] | None:
+    option = token.split("=", 1)[0]
+    return REBUILD_OPTION_SPECS.get(option)
+
+
+def parse_named_rebuild_args(args: list[str]) -> dict[str, int | float]:
+    updates: dict[str, int | float] = {}
+    seen_options: dict[str, str] = {}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        option_name = token.split("=", 1)[0]
+        spec = rebuild_option_spec(token)
+        if spec is None:
+            raise ValueError(f"Unknown rebuild option: {option_name}")
+
+        field_name, parser = spec
+        if field_name in seen_options:
+            raise ValueError(
+                f"Duplicate rebuild option for {field_name}: {seen_options[field_name]} and {option_name}"
+            )
+
+        if "=" in token:
+            raw_value = token.split("=", 1)[1]
+            if raw_value == "":
+                raise ValueError(f"Missing value for {option_name}")
+            index += 1
+        else:
+            if index + 1 >= len(args):
+                raise ValueError(f"Missing value for {option_name}")
+            next_token = args[index + 1]
+            if rebuild_option_spec(next_token) is not None:
+                raise ValueError(f"Missing value for {option_name}")
+            raw_value = next_token
+            index += 2
+
+        try:
+            updates[field_name] = parser(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid value for {option_name}: {raw_value}") from exc
+        seen_options[field_name] = option_name
+
+    return updates
+
+
+def parse_shell_rebuild_args(
+    args: list[str],
+    *,
+    current_values: dict[str, int | float],
+) -> dict[str, int | float]:
+    if not args:
+        raise ValueError("rebuild requires positional values or named options.")
+
+    if args[0].startswith("-"):
+        parsed_values = dict(current_values)
+        parsed_values.update(parse_named_rebuild_args(args))
+        return parsed_values
+
+    if any(arg.startswith("-") for arg in args[1:]):
+        raise ValueError("Do not mix positional values with named rebuild options.")
+
+    if len(args) not in {3, 5}:
+        raise ValueError("rebuild positional mode requires 3 or 5 values.")
+
+    try:
+        parsed_values = dict(current_values)
+        parsed_values["context_size"] = int(args[0])
+        parsed_values["hidden_dim"] = int(args[1])
+        parsed_values["learning_rate"] = float(args[2])
+        if len(args) == 5:
+            parsed_values["batch_size"] = int(args[3])
+            parsed_values["embed_dim"] = int(args[4])
+        return parsed_values
+    except ValueError as exc:
+        raise ValueError(
+            "Invalid rebuild positional values. Expected integers for context_size, "
+            "hidden_dim, batch_size, embed_dim and a float for learning_rate."
+        ) from exc
+
+
 def run_sample_command(
     trainer: TextGeneratorTrainer,
     *,
@@ -1324,19 +1432,27 @@ class InteractiveShell:
         print(f"Loaded checkpoint from {path}")
 
     def handle_rebuild(self, args: list[str]) -> None:
-        if len(args) not in {3, 5}:
-            print(
-                "Usage: rebuild <context_size> <hidden_dim> <learning_rate> "
-                "[batch_size] [embed_dim]"
-            )
+        current_values: dict[str, int | float] = {
+            "context_size": self.trainer.corpus.context_size,
+            "hidden_dim": self.trainer.model.hidden_dim,
+            "learning_rate": self.trainer.learning_rate,
+            "batch_size": self.trainer.batch_size,
+            "embed_dim": self.trainer.model.embed_dim,
+        }
+
+        try:
+            rebuild_values = parse_shell_rebuild_args(args, current_values=current_values)
+        except ValueError as exc:
+            print(exc)
+            print_rebuild_usage()
             return
 
         self.rebuild_model(
-            context_size=int(args[0]),
-            hidden_dim=int(args[1]),
-            learning_rate=float(args[2]),
-            batch_size=int(args[3]) if len(args) == 5 else None,
-            embed_dim=int(args[4]) if len(args) == 5 else None,
+            context_size=int(rebuild_values["context_size"]),
+            hidden_dim=int(rebuild_values["hidden_dim"]),
+            learning_rate=float(rebuild_values["learning_rate"]),
+            batch_size=int(rebuild_values["batch_size"]),
+            embed_dim=int(rebuild_values["embed_dim"]),
         )
 
     def handle_reset(self, args: list[str]) -> None:
@@ -1429,8 +1545,10 @@ class InteractiveShell:
         print("  save [path]              Save a checkpoint")
         print("  load [path] [--unsafe]   Load a checkpoint")
         print("                           --unsafe is only required for legacy pickle checkpoints")
-        print("  rebuild c h lr [b] [e]   Rebuild model with new context, hidden dim, lr,")
-        print("                           and optionally batch size and embed dim")
+        print("  rebuild [options]        Rebuild model; unspecified named values stay unchanged")
+        print("                           -c/--context-size -h/--hidden-dim")
+        print("                           -lr/--learning-rate -b/--batch-size -e/--embed-dim")
+        print("                           Legacy positional form still works: c h lr [b] [e]")
         print(
             "                           Limits: context_size >= 1, hidden_dim >= 1, "
             "batch_size >= 1, embed_dim >= 1, lr > 0"
