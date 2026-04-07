@@ -838,34 +838,35 @@ class TextGeneratorTrainer:
         }
 
     @classmethod
-    def load(
+    def read_checkpoint_payload(
         cls,
         path: Path,
-        corpus: Corpus,
+        *,
         allow_unsafe_checkpoint: bool = False,
-    ) -> "TextGeneratorTrainer":
+    ) -> dict[str, Any]:
         path = path.expanduser().resolve()
 
         if zipfile.is_zipfile(path):
-            payload = cls.load_safe_checkpoint(path)
-        else:
-            if not allow_unsafe_checkpoint:
-                raise ValueError(
-                    "Refusing to load a legacy pickle checkpoint without --allow-unsafe-checkpoint. "
-                    "Legacy pickle checkpoints can execute arbitrary code."
-                )
-            with path.open("rb") as handle:
-                payload = pickle.load(handle)
+            return cls.load_safe_checkpoint(path)
 
+        if not allow_unsafe_checkpoint:
+            raise ValueError(
+                "Refusing to load a legacy pickle checkpoint without --allow-unsafe-checkpoint. "
+                "Legacy pickle checkpoints can execute arbitrary code."
+            )
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+        corpus: Corpus,
+    ) -> "TextGeneratorTrainer":
         if payload["chars"] != corpus.chars:
             raise ValueError(
                 "Checkpoint vocabulary does not match the current training text. "
                 "Use the same shakespeare.txt that created the checkpoint."
-            )
-        if payload["model"]["context_size"] != corpus.context_size:
-            raise ValueError(
-                "Checkpoint context size does not match the current configuration. "
-                "Use the same --context-size value, or start with --fresh."
             )
         checkpoint_corpus_hash = payload.get("corpus_sha256")
         if checkpoint_corpus_hash is None:
@@ -877,6 +878,11 @@ class TextGeneratorTrainer:
                 "Checkpoint training text does not match the current corpus contents. "
                 "Use the same training text that created the checkpoint, or start with --fresh."
             )
+
+        checkpoint_context_size = payload["model"]["context_size"]
+        if corpus.context_size != checkpoint_context_size:
+            # The checkpoint is authoritative for architecture-sensitive settings.
+            corpus = Corpus(text=corpus.text, context_size=checkpoint_context_size)
 
         model = CharMLP.from_checkpoint(payload["model"])
         trainer = cls(
@@ -890,6 +896,36 @@ class TextGeneratorTrainer:
         trainer.train_steps = payload["trainer"]["train_steps"]
         trainer.rng.bit_generator.state = payload["trainer"]["rng_state"]
         return trainer
+
+    @classmethod
+    def load(
+        cls,
+        path: Path,
+        corpus: Corpus,
+        allow_unsafe_checkpoint: bool = False,
+    ) -> "TextGeneratorTrainer":
+        payload = cls.read_checkpoint_payload(
+            path,
+            allow_unsafe_checkpoint=allow_unsafe_checkpoint,
+        )
+        return cls.from_payload(payload, corpus)
+
+    @classmethod
+    def load_for_data_path(
+        cls,
+        path: Path,
+        *,
+        data_path: Path,
+        allow_unsafe_checkpoint: bool = False,
+    ) -> "TextGeneratorTrainer":
+        payload = cls.read_checkpoint_payload(
+            path,
+            allow_unsafe_checkpoint=allow_unsafe_checkpoint,
+        )
+        text = read_text(data_path)
+        checkpoint_context_size = payload["model"]["context_size"]
+        corpus = Corpus(text=text, context_size=checkpoint_context_size)
+        return cls.from_payload(payload, corpus)
 
 
 def build_new_trainer(
@@ -939,14 +975,11 @@ def load_trainer_from_checkpoint(
     checkpoint_path: Path,
     *,
     data_path: Path,
-    context_size: int,
     allow_unsafe_checkpoint: bool,
 ) -> TextGeneratorTrainer:
-    text = read_text(data_path)
-    corpus = Corpus(text=text, context_size=context_size)
-    return TextGeneratorTrainer.load(
+    return TextGeneratorTrainer.load_for_data_path(
         checkpoint_path,
-        corpus,
+        data_path=data_path,
         allow_unsafe_checkpoint=allow_unsafe_checkpoint,
     )
 
@@ -966,7 +999,6 @@ def build_trainer_for_target(
             load_trainer_from_checkpoint(
                 target.checkpoint_path,
                 data_path=data_path,
-                context_size=args.context_size,
                 allow_unsafe_checkpoint=args.allow_unsafe_checkpoint,
             ),
             target.checkpoint_path,
@@ -1416,16 +1448,16 @@ class InteractiveShell:
             raise ValueError("Usage: load [path] [--unsafe]")
         path = resolve_checkpoint_argument(path_args[0]) if path_args else self.run_target.checkpoint_path
         if path == self.run_target.checkpoint_path:
-            self.trainer = TextGeneratorTrainer.load(
+            self.trainer = TextGeneratorTrainer.load_for_data_path(
                 path,
-                self.trainer.corpus,
+                data_path=self.data_path,
                 allow_unsafe_checkpoint=allow_unsafe_checkpoint,
             )
         else:
             with acquire_exclusive_lock(explicit_checkpoint_lock_path(path), f"Checkpoint {path}"):
-                self.trainer = TextGeneratorTrainer.load(
+                self.trainer = TextGeneratorTrainer.load_for_data_path(
                     path,
-                    self.trainer.corpus,
+                    data_path=self.data_path,
                     allow_unsafe_checkpoint=allow_unsafe_checkpoint,
                 )
         self.source_checkpoint_path = path

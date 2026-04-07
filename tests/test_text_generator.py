@@ -484,6 +484,48 @@ class CheckpointSafetyTests(unittest.TestCase):
             for name, param in trainer.model.params.items():
                 np.testing.assert_allclose(loaded.model.params[name], param)
 
+    def test_load_for_data_path_uses_checkpoint_config_instead_of_current_runtime_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            checkpoint_path = root / "model.npz"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+
+            trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+            trainer.save(checkpoint_path, data_path)
+
+            loaded = text_generator.TextGeneratorTrainer.load_for_data_path(
+                checkpoint_path,
+                data_path=data_path,
+            )
+
+            self.assertEqual(loaded.corpus.context_size, trainer.corpus.context_size)
+            self.assertEqual(loaded.model.embed_dim, trainer.model.embed_dim)
+            self.assertEqual(loaded.model.hidden_dim, trainer.model.hidden_dim)
+            self.assertEqual(loaded.batch_size, trainer.batch_size)
+            self.assertEqual(loaded.learning_rate, trainer.learning_rate)
+
+    def test_load_uses_checkpoint_context_size_when_caller_corpus_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            checkpoint_path = root / "model.npz"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+
+            trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+            trainer.save(checkpoint_path, data_path)
+
+            mismatched_corpus = text_generator.Corpus(
+                text=data_path.read_text(encoding="utf-8"),
+                context_size=9,
+            )
+            loaded = text_generator.TextGeneratorTrainer.load(checkpoint_path, mismatched_corpus)
+
+            self.assertEqual(loaded.corpus.context_size, trainer.corpus.context_size)
+            self.assertEqual(loaded.model.context_size, trainer.model.context_size)
+            for name, param in trainer.model.params.items():
+                np.testing.assert_allclose(loaded.model.params[name], param)
+
     def test_checkpoint_load_rejects_changed_corpus_with_same_charset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -802,6 +844,34 @@ class InteractiveShellTests(unittest.TestCase):
                 self.assertIn("Unknown rebuild option", stdout.getvalue())
                 self.assertEqual(shell.trainer.corpus.context_size, 3)
 
+    def test_load_command_restores_checkpoint_config_after_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patched_paths(root):
+                _, shell, data_path, _ = self.make_shell(root=root, managed=True)
+                checkpoint_path = root / "student-copy.npz"
+                trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+                trainer.save(checkpoint_path, data_path)
+
+                with redirect_stdout(io.StringIO()):
+                    self.assertTrue(shell.execute("rebuild -c=5 -h=10 -e=6 -b=4 -lr=0.02"))
+
+                self.assertEqual(shell.trainer.corpus.context_size, 5)
+                self.assertEqual(shell.trainer.model.hidden_dim, 10)
+                self.assertEqual(shell.trainer.model.embed_dim, 6)
+                self.assertEqual(shell.trainer.batch_size, 4)
+                self.assertEqual(shell.trainer.learning_rate, 0.02)
+
+                with redirect_stdout(io.StringIO()) as stdout:
+                    self.assertTrue(shell.execute(f'load "{checkpoint_path}"'))
+
+                self.assertIn("Loaded checkpoint", stdout.getvalue())
+                self.assertEqual(shell.trainer.corpus.context_size, trainer.corpus.context_size)
+                self.assertEqual(shell.trainer.model.hidden_dim, trainer.model.hidden_dim)
+                self.assertEqual(shell.trainer.model.embed_dim, trainer.model.embed_dim)
+                self.assertEqual(shell.trainer.batch_size, trainer.batch_size)
+                self.assertEqual(shell.trainer.learning_rate, trainer.learning_rate)
+
     def test_sessions_command_marks_current_and_locked_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -951,6 +1021,69 @@ class CommandScopeTests(unittest.TestCase):
                         "alpha",
                         "--context-size",
                         "3",
+                        "--length",
+                        "5",
+                    ]
+                )
+
+                self.assertEqual(code, 0)
+                self.assertEqual(stderr, "")
+                self.assertTrue(stdout.strip())
+
+    def test_sample_command_uses_saved_checkpoint_config_despite_mismatched_current_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            checkpoint_path = root / "student-copy.npz"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+
+            trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+            trainer.save(checkpoint_path, data_path)
+
+            code, stdout, stderr = run_main(
+                [
+                    "sample",
+                    "--data",
+                    str(data_path),
+                    "--checkpoint",
+                    str(checkpoint_path),
+                    "--context-size",
+                    "9",
+                    "--embed-dim",
+                    "12",
+                    "--hidden-dim",
+                    "20",
+                    "--batch-size",
+                    "7",
+                    "--learning-rate",
+                    "0.02",
+                    "--length",
+                    "5",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertTrue(stdout.strip())
+
+    def test_sample_command_with_session_ignores_default_context_size_when_loading_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_path = root / "data.txt"
+            data_path.write_text("abcaabca\n", encoding="utf-8")
+            with patched_paths(root):
+                manager = text_generator.SessionManager()
+                target = manager.target_for_session("alpha")
+                trainer = make_trainer_for_text(data_path.read_text(encoding="utf-8"))
+                trainer.save(target.checkpoint_path, data_path)
+
+                code, stdout, stderr = run_main(
+                    [
+                        "sample",
+                        "--data",
+                        str(data_path),
+                        "--session",
+                        "alpha",
                         "--length",
                         "5",
                     ]
